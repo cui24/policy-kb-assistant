@@ -1,5 +1,7 @@
 # Policy KB Assistant
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Enterprise KB + ITSM Agent. This project combines policy Q&A, ticket workflows, and MCP-exposed tools behind one governed execution layer.
 
 The core design is intentional:
