@@ -22,7 +22,7 @@
 
 ## 可演示能力
 
-- 通过 `POST /ask` 做带 citations 的政策问答
+- 做带 citations 的政策问答（网页自然语言入口统一走 `POST /agent`，`POST /ask` 仍保留为直接 API 入口）
 - 通过 `POST /agent` 做一句话路由
 - 工单创建、查询、追加评论、催办、取消
 - 调用真实 HTTP API 的 Streamlit 网页
@@ -81,7 +81,7 @@ make ui
 - MCP ticket tools
 
 这个模式下的限制：
-- `POST /ask` 和依赖知识库的 `/agent` 需要有效的 `OPENAI_API_KEY`
+- 知识库问答（`POST /ask` 或被 `/agent` 路由为 `ASK`）需要有效的 `OPENAI_API_KEY`
 - 检索式问答还需要 Qdrant 和已入库文档
 
 ## Full Demo（Postgres + Qdrant + 文档入库）
@@ -132,8 +132,8 @@ make ui
 ```
 
 这个模式下可以演示：
-- `POST /ask`
-- 依赖知识库的 `/agent`
+- 网页经 `/agent` 路由的知识库问答
+- 如果你直接调 API，也可以单独调用 `POST /ask`
 - 草稿续办
 - 既有工单工具动作
 - Web 和 MCP 双入口

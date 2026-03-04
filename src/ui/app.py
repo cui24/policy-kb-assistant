@@ -4,7 +4,7 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
 一、程序目标
 1. 让 Streamlit 页面不再直接调用 Python 函数，而是真正走 L2 HTTP API。
 2. 默认入口走 `/agent`，展示“一句话 -> 路由 -> 问答或建单”的完整链路。
-3. 保留高级模式：可以单独调用 `/ask` 与 `/tickets`，方便调试和演示。
+3. 页面默认自然语言入口统一走 `/agent`；只保留手动建单表单直调 `/tickets`。
 4. 提供工单列表、详情查询和状态更新，让 UI 真正接上 L2 后端。
 5. 提供追溯区：可按 `request_id` 或 `ticket_id` 回放问答、审计和关联工单。
 6. 在 L4 中支持草稿续办：`NEED_MORE_INFO` 后可直接补地点/联系方式继续提交。
@@ -19,7 +19,7 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
    2.5 创建 `PolicyAPIClient`
    2.6 渲染主操作区：
        - `/agent` 一句话入口
-       - `/ask` 仅问答入口
+       - 经 `/agent` 路由的“仅问答”入口
        - `/tickets` 手动建单入口
    2.7 将最近一次 API 响应写入 `session_state`
    2.8 渲染问答结果、工单结果、抽取结果、Trace 信息
@@ -30,12 +30,11 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
 三、输入输出数据格式
 1. UI 输入：
    - `text`: 一句话自然语言输入，走 `/agent`
-   - `question`: 问答输入，走 `/ask`
+   - `question`: 问答输入，仍走 `/agent`
    - `ticket form`: 手动建单字段，走 `/tickets`
 2. API 输出：
-   - `/ask`: `AskResponse`
-   - `/tickets`: `TicketResponse` / `TicketDetailResponse`
    - `/agent`: `AgentResponse`
+   - `/tickets`: `TicketResponse` / `TicketDetailResponse`
 3. 页面状态：
    - 把最近一次 API 调用结果放到 `session_state`，便于刷新后继续查看
 
@@ -43,7 +42,7 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
 1. 让用户先配置 API 地址和默认身份
 2. 创建 API 客户端
 3. 用户点“一句话入口”就调 `/agent`
-4. 用户点“仅问答”就调 `/ask`
+4. 用户点“仅问答”仍走 `/agent`，由后端路由成问答
 5. 用户提交手动工单表单就调 `/tickets`
 6. 页面根据返回 JSON 决定展示：
    - answer + citations
@@ -218,9 +217,9 @@ def _render_header() -> None:
         <div class="hero-card">
           <div class="hero-title">政策问答、工单与审计演示</div>
           <div class="hero-subtitle">
-            当前页面已切换为通过 HTTP 调用 L2 API。默认入口走 <code>/agent</code>，
-            能展示“一句话问答 / 建单 / 补信息”的真实后端闭环；同时保留 <code>/ask</code>
-            与 <code>/tickets</code> 的单独入口，方便调试与教学演示。
+            当前页面已切换为通过 HTTP 调用 L2 API。默认自然语言入口统一走 <code>/agent</code>，
+            能展示“一句话问答 / 建单 / 补信息 / 工单操作”的真实后端闭环；仅保留手动建单表单
+            直调 <code>/tickets</code>，便于对比受控编排与原始接口。
           </div>
         </div>
         """,
@@ -596,18 +595,19 @@ def _handle_agent_submit(client: PolicyAPIClient, text: str, user_name: str, dep
 
 
 def _handle_ask_submit(client: PolicyAPIClient, question: str, user_name: str, department: str) -> None:
-    """执行 `/ask` 调用并保存结果。"""
+    """执行“仅问答”入口，但仍统一经 `/agent` 路由。"""
     _clear_error()
     try:
-        result = client.ask(question=question, user=user_name, department=department)
+        result = client.agent(text=question, user=user_name, department=department)
     except APIClientError as exc:
-        _set_error("调用 /ask", exc)
+        _set_error("调用 /agent（问答路径）", exc)
         return
 
-    st.session_state["last_ask"] = result
-    st.session_state["last_agent"] = None
-    if result.get("request_id"):
-        st.session_state["trace_request_id"] = str(result.get("request_id"))
+    st.session_state["last_ask"] = None
+    st.session_state["last_agent"] = result
+    kb_response = result.get("kb") or {}
+    if isinstance(kb_response, dict) and kb_response.get("request_id"):
+        st.session_state["trace_request_id"] = str(kb_response.get("request_id"))
 
 
 
@@ -1108,7 +1108,7 @@ def main() -> None:
         with agent_left:
             run_agent = st.button("调用 /agent", type="primary", use_container_width=True)
         with agent_right:
-            run_ask = st.button("仅调用 /ask", use_container_width=True)
+            run_ask = st.button("仅问答（走 /agent）", use_container_width=True)
 
         if run_agent:
             text = agent_text.strip()
@@ -1126,23 +1126,22 @@ def main() -> None:
             if not question:
                 st.warning("请先输入问题。")
             else:
-                with st.spinner("正在调用 /ask ..."):
+                with st.spinner("正在调用 /agent（问答路径）..."):
                     t0 = time.time()
                     _handle_ask_submit(client, question, user_name, department)
                     t1 = time.time()
                 st.caption(f"本次前端请求耗时：{t1 - t0:.2f}s · base_url={base_url}")
 
-        ask_response = st.session_state.get("last_ask")
         agent_response = st.session_state.get("last_agent")
 
-        if isinstance(ask_response, dict):
-            st.subheader("问答结果（/ask）")
-            _render_kb_response(ask_response)
-        elif isinstance(agent_response, dict):
-            st.subheader("一句话结果（/agent）")
+        if isinstance(agent_response, dict):
+            if str(agent_response.get("route") or "") == "ASK":
+                st.subheader("问答结果（经 /agent 路由）")
+            else:
+                st.subheader("一句话结果（/agent）")
             _render_agent_response(agent_response)
         else:
-            st.info("点击“调用 /agent”或“仅调用 /ask”后，这里会展示真实后端返回的结果。")
+            st.info("点击“调用 /agent”或“仅问答（走 /agent）”后，这里会展示真实后端返回的结果。")
 
         _render_draft_continue_form(client, user_name, department)
 

@@ -22,7 +22,7 @@ Two practical differentiators:
 
 ## What You Can Demo
 
-- Policy Q&A with citations via `POST /ask`
+- Policy Q&A with citations (the web UI routes natural-language requests through `POST /agent`; `POST /ask` remains available as a direct API endpoint)
 - One-shot agent routing via `POST /agent`
 - Ticket creation, lookup, comments, escalation, and cancellation
 - Streamlit web UI that calls the real HTTP API
@@ -81,7 +81,7 @@ What works in this mode:
 - MCP ticket tools
 
 What is intentionally limited in this mode:
-- `POST /ask` and KB-backed `/agent` flows need a valid `OPENAI_API_KEY`
+- Knowledge-backed Q&A (`POST /ask` or `/agent` routed to `ASK`) needs a valid `OPENAI_API_KEY`
 - Retrieval-backed Q&A also needs Qdrant and ingested documents
 
 ## Full Demo (Postgres + Qdrant + Document Ingestion)
@@ -132,8 +132,8 @@ make ui
 ```
 
 In this mode, you can demo:
-- `POST /ask`
-- KB-assisted `/agent`
+- KB-assisted `/agent` from the web UI
+- `POST /ask` if you want to call the API directly
 - Draft continuation
 - Existing-ticket tool actions
 - Web UI + MCP side by side

@@ -32,7 +32,7 @@ def test_streamlit_app_renders_expected_controls() -> None:
 
     button_labels = [button.label for button in app.button]
     assert "调用 /agent" in button_labels
-    assert "仅调用 /ask" in button_labels
+    assert "仅问答（走 /agent）" in button_labels
     assert "创建工单" in button_labels
     assert "检测 API" in button_labels
 

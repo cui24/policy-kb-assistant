@@ -49,12 +49,13 @@ In practice this means:
 The default web flow is:
 
 1. The user clicks a button in Streamlit.
-2. `src/ui/api_client.py` turns that action into an HTTP request.
-3. FastAPI receives the request and creates a DB session.
-4. `src/api/services.py` routes the request.
-5. The selected workflow writes business rows and audit rows.
-6. JSON is returned to the UI.
-7. The UI stores the result in `st.session_state` and renders it.
+2. Natural-language UI actions are sent to `POST /agent`; only the explicit manual ticket form uses raw ticket endpoints.
+3. `src/ui/api_client.py` turns that action into an HTTP request.
+4. FastAPI receives the request and creates a DB session.
+5. `src/api/services.py` routes the request.
+6. The selected workflow writes business rows and audit rows.
+7. JSON is returned to the UI.
+8. The UI stores the result in `st.session_state` and renders it.
 
 The web UI is intentionally thin. It should not contain business rules that can bypass the backend.
 
