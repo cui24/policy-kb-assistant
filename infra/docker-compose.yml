@@ -1,0 +1,38 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333", "6334:6334"]
+    volumes:
+      - qdrant_data:/qdrant/storage
+    profiles: ["l0", "l1", "l2", "l3", "l4"]
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: policy
+      POSTGRES_PASSWORD: policy
+      POSTGRES_DB: policy_kb
+    ports: ["5432:5432"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    profiles: ["l2", "l3", "l4"]
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    profiles: ["l2", "l3", "l4"]
+
+  # L4 最小可观测（先预留）
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    profiles: ["l4"]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    profiles: ["l4"]
+
+volumes:
+  qdrant_data:
+  pg_data:

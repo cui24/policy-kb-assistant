@@ -1,0 +1,12 @@
+qdrant-client
+sentence-transformers
+pypdf
+python-dotenv
+tqdm
+rich
+langchain-text-splitters==1.1.1
+langchain-core==1.2.16
+langchain-openai==1.1.10
+openai
+pydantic
+PyYAML

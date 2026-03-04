@@ -1,0 +1,10 @@
+-r l0.txt
+fastapi
+uvicorn[standard]
+mcp==1.26.0
+sqlalchemy
+psycopg2-binary
+redis
+orjson
+alembic
+pytest

@@ -1,0 +1,11 @@
+chunk:
+  size: 800
+  overlap: 120
+retrieval:
+  top_k: 6
+citations:
+  mode: "page+snippet"
+  max_snippet_chars: 220
+generation:
+  max_tokens: 400
+  retry_max_tokens: 500

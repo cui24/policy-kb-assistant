@@ -1,0 +1,5 @@
+-r l0.txt
+# 可选 UI（任选其一）
+streamlit
+# gradio
+pytest

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "policy-kb-itsm": {
+      "type": "stdio",
+      "command": "/path/to/python",
+      "args": ["-m", "src.mcp_stdio_server"],
+      "env": {
+        "PYTHONPATH": "/path/to/policy-kb-assistant",
+        "MCP_ACTOR_USER_ID": "alice",
+        "MCP_DEPARTMENT": "IT"
+      }
+    }
+  }
+}

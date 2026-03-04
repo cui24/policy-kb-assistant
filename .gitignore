@@ -1,0 +1,38 @@
+# local env / secrets
+.env
+*.env
+!.env.example
+
+# local editor / session state
+.specstory/
+.cursor/mcp.json
+
+# runtime data / generated outputs
+logs/
+outputs/
+tmp/
+qdrant_storage/
+*.db
+*.sqlite
+*.sqlite3
+*:Zone.Identifier
+
+# public demo data may live under data/demo/
+# local-only or user-supplied docs stay under data/raw/
+data/raw/
+data/cache/
+data/processed/
+docs/archive/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+.ipynb_checkpoints/
+
+# misc OS noise
+.DS_Store

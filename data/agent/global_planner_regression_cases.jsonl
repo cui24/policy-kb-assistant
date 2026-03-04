@@ -1,0 +1,30 @@
+{"utterance":"帮我看看我那个工单现在到哪了","category":"省略对象/指代","expected_tool":"lookup_ticket","notes":"若系统无法从记忆推断 ticket_id，应追问 ticket_id。"}
+{"utterance":"我上次报的断网问题还没好吗？","category":"省略对象/指代","expected_tool":"lookup_ticket","notes":"无 TCK，后续若接 memory 可从历史关联，否则应追问。"}
+{"utterance":"还是那张单，补充一下：交换机在走廊","category":"省略对象/指代","expected_tool":"add_ticket_comment","notes":"若无法推断 ticket_id，应追问。"}
+{"utterance":"把刚才那张撤掉吧，已经好了","category":"省略对象/指代","expected_tool":"cancel_ticket","notes":"高风险，且缺对象；后续应确认或追问 ticket_id。"}
+{"utterance":"帮我催一下之前那个","category":"省略对象/指代","expected_tool":"escalate_ticket","notes":"缺对象；无记忆时应追问。"}
+{"utterance":"我想关掉我刚建的单","category":"省略对象/指代","expected_tool":"cancel_ticket","notes":"高风险；无 ticket_id 时不应直接执行。"}
+{"utterance":"给工单补个联系方式：138xxxx","category":"省略对象/指代","expected_tool":"add_ticket_comment","notes":"如果正处于 draft_mode，应优先 continue_ticket_draft。"}
+{"utterance":"我刚才填错了地址，改一下","category":"省略对象/指代","expected_tool":"continue_ticket_draft","notes":"如果已有 draft_id 走草稿；否则已建单可转评论更正。"}
+{"utterance":"那单别弄了","category":"省略对象/指代","expected_tool":"cancel_ticket","notes":"极端口语化，高风险。"}
+{"utterance":"就按上次那个工单继续","category":"省略对象/指代","expected_tool":"continue_ticket_draft","notes":"若有 draft_id 应优先草稿；否则需追问对象。"}
+{"utterance":"查一下 TCK-2026-AB12 的进度，顺便备注一下交换机在走廊","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"复合读写；当前 MVP 只会走单步，子规划器需做固定优先级选择。"}
+{"utterance":"TCK-2026-AB12 还没处理的话就帮我催一下","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"条件句；MVP 可直接转入 ticket 子规划器。"}
+{"utterance":"把 TCK-2026-AB12 取消了，然后告诉我状态","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"取消确认态会打断复合意图。"}
+{"utterance":"TCK-2026-AB12 处理人是谁？顺便加急","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"复合读写；当前系统只执行一个动作。"}
+{"utterance":"TCK-2026-AB12 先查下，如果还在排队就催办","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"多步规划示例；当前 MVP 仍单步。"}
+{"utterance":"取消 TCK-2026-AB12，因为好了，另外我想问下报修流程","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"跨域复合；当前优先进入 ticket 路径。"}
+{"utterance":"给 TCK-2026-AB12 留言：别敲门，电话联系；同时帮我催一下","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"复合 + 优先级冲突；用于回归。"}
+{"utterance":"查一下 TCK-2026-AB12，如果能取消就取消","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"语义模糊；当前通常会走单步。"}
+{"utterance":"TCK-2026-AB12 我不想等了，撤销并备注原因","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"取消包含 reason，高风险优先。"}
+{"utterance":"TCK-2026-AB12 状态不对，备注一下：其实已经恢复了，顺便关单","category":"复合意图","expected_tool":"ticket_tool_planner","notes":"高风险优先，最终会走取消确认态。"}
+{"utterance":"TCK-2026-AB12 太慢了","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"应由子规划器偏向 escalate_ticket。"}
+{"utterance":"TCK-2026-AB12 能不能快点","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"弱催办表达。"}
+{"utterance":"TCK-2026-AB12 我补一句：交换机在走廊","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"应由子规划器偏向 add_ticket_comment。"}
+{"utterance":"TCK-2026-AB12 更新一下信息：电话换成 139xxxx","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"更像评论而不是查单。"}
+{"utterance":"TCK-2026-AB12 不用修了，已经好了","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"应由子规划器偏向 cancel_ticket 并进入确认态。"}
+{"utterance":"TCK-2026-AB12 这事算了","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"口语化取消。"}
+{"utterance":"TCK-2026-AB12 现在是谁在处理","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"应由子规划器偏向 lookup_ticket。"}
+{"utterance":"TCK-2026-AB12 还要多久","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"当前可默认查进度。"}
+{"utterance":"TCK-2026-AB12 我想加一句话","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"弱评论表达。"}
+{"utterance":"TCK-2026-AB12 关掉它","category":"弱关键词/口语化","expected_tool":"ticket_tool_planner","notes":"应由子规划器偏向 cancel_ticket 并进入确认态。"}

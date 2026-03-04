@@ -1,0 +1,216 @@
+[
+  {
+    "id": "pos-001",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "学生在校期间依法享有哪些权利？请概括要点。"
+  },
+  {
+    "id": "pos-002",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "学生在校期间依法履行哪些义务？请概括要点。"
+  },
+  {
+    "id": "pos-003",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "新生因故不能按期入学应当怎么做？未请假或请假逾期通常会怎样处理？"
+  },
+  {
+    "id": "pos-004",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "学校对新生入学资格复查主要包括哪些方面？复查不合格的后果是什么？"
+  },
+  {
+    "id": "pos-005",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "每学期开学时学生需要办理什么手续？未按规定缴费或不符合条件会怎样？"
+  },
+  {
+    "id": "pos-006",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "学生申请转学有哪些情形不得转学？请列举条款中的要点。"
+  },
+  {
+    "id": "pos-007",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "学生有哪些情形学校可予退学处理？请列举要点。"
+  },
+  {
+    "id": "pos-008",
+    "label": "pos",
+    "expected_doc": "moe_student_management",
+    "q": "学生对处分决定不服，申诉的期限是多久？申诉处理委员会一般应在多久内作出复查结论？"
+  },
+  {
+    "id": "pos-009",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "入住宿舍需要携带哪些材料或手续？到哪里登记领取什么物品后方可入住？"
+  },
+  {
+    "id": "pos-010",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "未经批准能否私自调换房间或床位？空房间、空床位由谁统一管理？"
+  },
+  {
+    "id": "pos-011",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "办理休学、退学、出国等离校手续后，多久内必须搬离并腾空床位？毕业离校时还需要退还哪些物品、完成什么验收？"
+  },
+  {
+    "id": "pos-012",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "住宿期间对公寓设施设备有哪些保护责任？如果损坏设施应如何处理？"
+  },
+  {
+    "id": "pos-013",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "宿舍与公共区域的卫生和环境有哪些要求？哪些行为被明确禁止？"
+  },
+  {
+    "id": "pos-014",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "公寓楼内有哪些安全方面的禁止事项？请概括主要内容。"
+  },
+  {
+    "id": "pos-015",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "宿舍内哪些电器或器具被禁止使用？是否允许私自接电线？违反造成损失如何处理？"
+  },
+  {
+    "id": "pos-016",
+    "label": "pos",
+    "expected_doc": "pku_dorm_rules",
+    "q": "宿舍熄灯制度如何规定？会客或来访人员进入宿舍有哪些要求？"
+  },
+  {
+    "id": "pos-017",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "如遇校园网网络设备及线路故障，应联系哪个部门？金明校区服务大厅地点和电话是什么？"
+  },
+  {
+    "id": "pos-018",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "宿舍区网络报修有哪些方式？请按手册给出的方式概括步骤。"
+  },
+  {
+    "id": "pos-019",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "统一身份认证的登录地址是什么？用户名和默认密码是什么？首次登录后建议做什么操作？"
+  },
+  {
+    "id": "pos-020",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "忘记统一身份认证密码如何处理？如果绑定的手机号或邮箱也不记得了怎么办？"
+  },
+  {
+    "id": "pos-021",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "校园有线网络如何认证上网？在认证成功后，上网完毕如何完成下线操作？"
+  },
+  {
+    "id": "pos-022",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "校园无线网络如何连接并认证？教职工和学生分别连接哪个SSID？什么是无感知认证？"
+  },
+  {
+    "id": "pos-023",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "认证页面无法自动弹出时该怎么做？在浏览器地址栏应输入什么地址？郑州校区有什么不同？"
+  },
+  {
+    "id": "pos-024",
+    "label": "pos",
+    "expected_doc": "henu_network_manual",
+    "q": "为什么开启随机MAC地址会导致需要重新认证甚至无法正常使用无线网？手册给出的解决办法是什么？"
+  },
+  {
+    "id": "neg-001",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "公司年终奖发放规则是什么？"
+  },
+  {
+    "id": "neg-002",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "员工差旅报销需要哪些材料，走什么审批流程？"
+  },
+  {
+    "id": "neg-003",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "公司门禁卡丢失如何补办？需要多久？"
+  },
+  {
+    "id": "neg-004",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "公司内部OA系统网址是多少？如何申请开通权限？"
+  },
+  {
+    "id": "neg-005",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "公司请假制度中婚假、产假、陪产假分别多少天？"
+  },
+  {
+    "id": "neg-006",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "宿舍是否允许安装空调或更换空调？需要什么审批？"
+  },
+  {
+    "id": "neg-007",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "校园网是否提供固定公网IP申请？办理流程是什么？"
+  },
+  {
+    "id": "neg-008",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "统一身份认证是否支持人脸识别登录？如果支持如何开启？"
+  },
+  {
+    "id": "neg-009",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "校园网是否支持eduroam漫游？连接方法是什么？"
+  },
+  {
+    "id": "neg-010",
+    "label": "neg",
+    "expected_doc": null,
+    "neg_type": "easy_cross_domain",
+    "q": "学生转专业需要提交哪些材料清单？"
+  }
+]

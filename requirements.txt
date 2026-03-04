@@ -1,0 +1,5 @@
+# Default aggregate requirements for the full local dev/runtime stack.
+# Includes API/MCP/runtime deps plus Streamlit/test tooling.
+# For narrower installs, use the layered files under requirements/ directly.
+-r requirements/l3.txt
+-r requirements/l1.txt
