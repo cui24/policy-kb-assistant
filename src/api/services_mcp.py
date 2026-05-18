@@ -51,6 +51,7 @@ def _audit_log(
         db,
         {
             "actor": actor,
+            "actor_user_id": actor,
             "action_type": action_type,
             "target_type": target_type,
             "target_id": target_id,
@@ -74,6 +75,7 @@ def _append_audit_log_uncommitted(
     db.add(
         models.AuditLog(
             actor=actor,
+            actor_user_id=actor,
             action_type=action_type,
             target_type=target_type,
             target_id=target_id,
@@ -131,6 +133,8 @@ def invoke_ticket_tool(
         db,
         plan=plan,
         actor=actor,
+        actor_user_id=actor,
+        actor_role=None,
         request_id=request_id,
         confirmation_verified=False,
     )
@@ -230,7 +234,13 @@ def request_cancel_ticket_workflow(
             reason="ticket_not_found",
         )
 
-    if not services._actor_satisfies_auth_rule(actor, "owner_or_admin", ticket):
+    if not services._actor_satisfies_auth_rule(
+        actor,
+        actor_user_id=actor,
+        actor_role=None,
+        auth_rule="owner_or_admin",
+        ticket=ticket,
+    ):
         _reject_tool_call(
             db,
             actor=actor,
@@ -349,6 +359,7 @@ def confirm_cancel_ticket_workflow(
         db,
         ticket_id=ticket_id,
         actor=actor,
+        actor_user_id=actor,
         reason=str((pending_action.args_json or {}).get("reason") or ""),
         audit_source=MCP_AUDIT_SOURCE,
     )

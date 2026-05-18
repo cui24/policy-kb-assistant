@@ -1,0 +1,8 @@
+doc_id,title,category,policy_type,doc_family,status,version,effective_date,family_id,authority_level,source_file,notes
+FIN-01,天津中绿电投资股份有限公司,finance,financial_management,financial_management,active,v1.0,2014-08-10,FIN_FINANCIAL_GENERAL,company_policy,data/raw/财务/FIN-01天津中绿电投资股份有限公司.pdf,
+FIN-02,深圳华控赛格股份有限公司员工因公出差管理办法,finance,travel_policy,travel_reimbursement,active,v1.0,2021-03-07,FIN_TRAVEL_REIMBURSEMENT,company_policy,data/raw/财务/FIN-02深圳华控赛格股份有限公司员工因公出差管理办法.pdf,
+FIN-03,广东太力科技集团股份有限公司财务管理制度,finance,financial_management,financial_management,active,v1.0,2021-11-21,FIN_FINANCIAL_GENERAL,company_policy,data/raw/财务/FIN-03广东太力科技集团股份有限公司财务管理制度.pdf,
+FIN-04,福安药业(集团)股份有限公司,finance,financial_management,financial_management,active,v1.0,2018-06-06,FIN_FINANCIAL_GENERAL,company_policy,data/raw/财务/FIN-04福安药业(集团)股份有限公司.pdf,
+FIN-05,江西省广德环保科技股份有限公司财务管理制度,finance,financial_management,financial_management,active,v1.0,2020-04-26,FIN_FINANCIAL_GENERAL,company_policy,data/raw/财务/FIN-05江西省广德环保科技股份有限公司财务管理制度.pdf,
+FIN-06,四川富临运业集团股份有限公司,finance,financial_management,financial_management,active,v1.0,2025-03-01,FIN_PAYMENT_APPROVAL,company_policy,data/raw/财务/FIN-06四川富临运业集团股份有限公司.pdf,
+FIN-07,易联众信息技术股份有限公司全面预算管理制度,finance,budget_policy,budget_management,active,v1.0,2025-11-01,FIN_BUDGET_MANAGEMENT,company_policy,data/raw/财务/FIN-07易联众信息技术股份有限公司全面预算管理制度.pdf,

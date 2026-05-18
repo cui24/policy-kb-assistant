@@ -1,0 +1,4 @@
+# Optional MCP dependencies.
+# Keep this file separate so API base image can build even when mirror/index
+# cannot resolve MCP transitive dependencies.
+mcp==1.26.0

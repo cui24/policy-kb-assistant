@@ -1,0 +1,7 @@
+doc_id,title,category,policy_type,doc_family,status,version,effective_date,family_id,authority_level,source_file,notes
+IT-01,复星集团,it,it_general_policy,it_governance,active,v1.0,2024-08-28,IT_INFO_SECURITY_POLICY,company_policy,data/raw/IT/IT-01复星集团.pdf,
+IT-02,江苏金飞达服装股份有限公司,it,it_general_policy,it_governance,active,v1.0,2011-09-01,IT_INFO_SYSTEM_MANAGEMENT,company_policy,data/raw/IT/IT-02江苏金飞达服装股份有限公司.pdf,
+IT-03,ERP 系统账户权限管理制度,it,account_permission_policy,account_permission,active,v1.0,2013-02-06,IT_ERP_ACCOUNT_PERMISSION,company_policy,data/raw/IT/IT-03ERP 系统账户权限管理制度.pdf,
+IT-05,信息系统安全管理制度,it,it_security_policy,it_security,active,v1.0,2015-12-08,IT_INFO_SECURITY_POLICY,company_policy,data/raw/IT/IT-05信息系统安全管理制度.pdf,
+IT-06,通威股份有限公司信息安全与隐私保护政策,it,it_security_policy,it_security,active,v1.0,2023-08-04,IT_INFO_SECURITY_POLICY,company_policy,data/raw/IT/IT-06通威股份有限公司信息安全与隐私保护政策.pdf,
+IT-07,证券期货业信息系统运维管理规范,it,operation_maintenance_policy,it_ops,active,v1.0,2013-01-31,IT_OPS_MAINTENANCE_SPEC,company_policy,data/raw/IT/IT-07证券期货业信息系统运维管理规范.pdf,

@@ -1,0 +1,9 @@
+doc_id,title,category,policy_type,doc_family,status,version,effective_date,family_id,authority_level,source_file,notes
+HR-01,博雷《员工手册》,hr,employee_handbook,employee_handbook,active,v1.0,2020-12-07,HR_EMPLOYEE_HANDBOOK,company_policy,data/raw/人事/HR-01博雷《员工手册》.pdf,
+HR-02,江苏亨通员工手册,hr,employee_handbook,employee_handbook,active,v1.0,2020-04-09,HR_EMPLOYEE_HANDBOOK,company_policy,data/raw/人事/HR-02江苏亨通员工手册.pdf,
+HR-03,财联社员工手册,hr,employee_handbook,employee_handbook,active,v1.0,2015-05-25,HR_EMPLOYEE_HANDBOOK,company_policy,data/raw/人事/HR-03财联社员工手册.pdf,
+HR-04,中国服装股份有限公司人事管理制度,hr,hr_general_policy,employee_management,active,v1.0,2017-03-16,HR_HR_POLICY_GENERAL,company_policy,data/raw/人事/HR-04中国服装股份有限公司人事管理制度.pdf,
+HR-05,广东长青人事管理制度,hr,hr_general_policy,employee_management,active,v1.0,2016-12-17,HR_HR_POLICY_GENERAL,company_policy,data/raw/人事/HR-05广东长青人事管理制度.pdf,
+HR-06,深圳大通考勤管理制度,hr,attendance_policy,attendance_management,active,v1.0,2014-07-13,HR_ATTENDANCE_POLICY,company_policy,data/raw/人事/HR-06深圳大通考勤管理制度.pdf,
+HR-07,深圳大通绩效考核,hr,performance_policy,performance_management,active,v1.0,2025-08-30,HR_PERFORMANCE_POLICY,company_policy,data/raw/人事/HR-07深圳大通绩效考核.pdf,
+HR-08,长城汽车股份有限公司薪酬管理制度,hr,compensation_policy,compensation_management,active,v1.0,2025-12-01,HR_COMPENSATION_POLICY,company_policy,data/raw/人事/HR-08长城汽车股份有限公司薪酬管理制度.pdf,

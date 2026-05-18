@@ -1,0 +1,145 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      args:
+        INSTALL_MCP: "1"
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      DATABASE_URL: postgresql+psycopg2://policy:policy@postgres:5432/policy_kb
+      REDIS_URL: redis://redis:6379/0
+      POLICY_API_BASE_URL: http://api:8080
+      AUTO_MIGRATE_ON_STARTUP: "true"
+      AGENT_MCP_CLIENT_ENABLED: "true"
+      AGENT_MCP_SERVER_URL: http://mcp:9000/mcp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      kb-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    volumes:
+      - model_cache:/root/.cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      args:
+        INSTALL_MCP: "1"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://policy:policy@postgres:5432/policy_kb
+      REDIS_URL: redis://redis:6379/0
+      AUTO_MIGRATE_ON_STARTUP: "false"
+      MCP_ACTOR_USER_ID: ${MCP_ACTOR_USER_ID:-demo_user}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 9000
+      MCP_STREAMABLE_HTTP_PATH: /mcp
+    command: ["python", "-m", "src.mcp_http_server"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    volumes:
+      - model_cache:/root/.cache
+    restart: unless-stopped
+
+  kb-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: policy_kb_l0
+      APP_LEVEL: l0
+      KB_INIT_WAIT_SECONDS: "120"
+    depends_on:
+      qdrant:
+        condition: service_started
+    command: ["bash", "/app/scripts/kb_init.sh"]
+    volumes:
+      - model_cache:/root/.cache
+    restart: "no"
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    env_file:
+      - .env
+    environment:
+      POLICY_API_BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: policy
+      POSTGRES_PASSWORD: policy
+      POSTGRES_DB: policy_kb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U policy -d policy_kb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  qdrant_data:
+  pg_data:
+  model_cache:

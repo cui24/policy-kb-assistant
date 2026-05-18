@@ -303,3 +303,42 @@ class AuditLogResponse(BaseModel):
     target_id: str
     request_id: str
     payload: dict[str, Any]
+
+
+class AuthRegisterRequest(BaseModel):
+    """用户注册请求体。"""
+
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=8, max_length=128)
+    email: str | None = Field(default=None, max_length=128)
+    phone: str | None = Field(default=None, max_length=32)
+
+
+class AuthLoginRequest(BaseModel):
+    """用户登录请求体。"""
+
+    identifier: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class UserProfileResponse(BaseModel):
+    """登录态用户信息。"""
+
+    id: str
+    username: str
+    role: str
+    email: str | None = None
+    phone: str | None = None
+    is_active: bool
+    created_at: str
+    updated_at: str
+    last_login_at: str | None = None
+
+
+class AuthTokenResponse(BaseModel):
+    """鉴权令牌响应。"""
+
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    user: UserProfileResponse

@@ -3,6 +3,18 @@ chunk:
   overlap: 120
 retrieval:
   top_k: 6
+  mode: "dense"
+  dense_candidate_k: 30
+  bm25_candidate_k: 30
+  rrf_k: 60
+  dense_weight: 1.0
+  bm25_weight: 0.8
+rerank:
+  enabled: false
+  model: "BAAI/bge-reranker-base"
+  candidate_k: 30
+  batch_size: 8
+  max_chars: 1200
 citations:
   mode: "page+snippet"
   max_snippet_chars: 220

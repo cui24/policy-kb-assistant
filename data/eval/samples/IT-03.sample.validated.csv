@@ -1,0 +1,3 @@
+doc_id,chunk_id,section_path,page_start,page_end,rule_type,effective_date,keywords,evidence_span,text
+IT-03,IT-03_chunk_0001,一、目的,1,1,definition,2013-02-06,ERP;系统运行;信息安全,确保 ERP 系统高效运行，有效管理公司信息。,本制度用于确保 ERP 系统高效稳定运行，并通过权限与流程管理保障公司信息资产安全，减少误操作和越权访问风险。
+IT-03,IT-03_chunk_0002,五、流程说明 > 1. 账号或权限申请,2,2,procedure,2013-02-06,账号申请;权限申请;审批流程,新增人员需要使用 ERP 时...由本人填写 ERP 系统账户/权限申请表。,新增人员需要使用 ERP 时，应按照岗位职责申请开通账户和对应权限，并由本人填写 ERP 系统账户/权限申请表提交审批后由技术支持执行开通。

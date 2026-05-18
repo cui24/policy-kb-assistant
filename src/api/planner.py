@@ -645,18 +645,21 @@ def build_global_planner_prompt(
         "你必须信任系统提供的状态字段，并遵守以下硬约束："
         "1) 不得编造或猜测 ticket_id / draft_id；若 has_ticket_id=true，必须使用 provided_ticket_id；若 has_draft_id=true，必须使用 provided_draft_id；"
         "2) 若用户请求涉及 cancel_ticket，系统后续会做确认态；当前全局规划阶段只需要在进入 ticket_tool_planner 时把原始文本转交给子规划器；"
-        "3) 只输出 JSON，禁止 Markdown 与解释。"
+        "3) 若语义明显是“已有工单跟进”（如上次报的、那张单、刚才那张、催办/取消/补充），但系统未提供 ticket_id，"
+        "必须输出 ticket_tool_planner 且 missing_fields 至少包含 ticket_id，不得降级为 kb_answer。"
+        "4) 只输出 JSON，禁止 Markdown 与解释。"
         "system_state 中还可能包含 short_term_memory、memory_ticket_applied、memory_draft_applied；这些字段由系统提供，只能用于辅助理解上下文，不能覆盖系统已给定的 ID。"
         "最小决策策略必须严格按顺序执行："
         "A) 若 draft_mode=true 或 has_draft_id=true，则选择 continue_ticket_draft，"
         "args={\"draft_id\":provided_draft_id,\"fields\":<保守抽取的 fields>}；"
         "B) 否则若 ticket_tool_mode=true 或 has_ticket_id=true，则选择 ticket_tool_planner，"
         "args={\"ticket_id\":provided_ticket_id,\"raw_text\":<用户原话>}；"
+        "B2) 若无 ticket_id 但属于已有工单跟进语义，则仍选择 ticket_tool_planner，并通过 missing_fields=[\"ticket_id\"] 请求追问；"
         "C) 否则若用户明显是在咨询制度、政策、流程、规定等知识问答，则选择 kb_answer，"
         "args={\"query\":<用户原话>}；"
         "D) 否则默认 create_ticket，args={\"text\":<用户原话>,\"fields\":<保守抽取的 fields>}。"
         "fields 只能是 JSON 对象；不确定的字段不要编造。location/contact/title/description 能明确抽取才填，不能确定就留空。"
-        "missing_fields 在当前阶段通常输出空数组。"
+        "missing_fields 默认空数组；只有缺关键对象（如 ticket_id/draft_id）或关键参数时才填写。"
         "输出格式固定为："
         '{"tool":"kb_answer","args":{"query":"示例"},"need_confirmation":false,"missing_fields":[]}'
     )
@@ -689,6 +692,7 @@ def build_global_repair_prompt(
         "你的任务不是重新解释业务，而是把给定的错误输出修复成严格 JSON。"
         "你必须只输出一个合法的 ToolPlan JSON 对象，不得输出解释。"
         "tool 只能是提供 tools 列表中的 name；provided_ticket_id 与 provided_draft_id 若存在，必须原样使用。"
+        "若属于已有工单跟进语义但系统缺 ticket_id，必须保留 ticket_tool_planner 并填 missing_fields=[\"ticket_id\"]，不能改成 kb_answer。"
     )
     user_prompt = (
         f"tools:\n{_tools_json_text(tools_json)}\n\n"

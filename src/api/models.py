@@ -36,12 +36,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, String, Text, Enum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.api.db import Base
-
+import enum
 
 JsonType = JSON().with_variant(JSONB, "postgresql")
 
@@ -51,24 +51,76 @@ def utc_now() -> datetime:
     """统一生成 UTC 时间，避免不同表的时间源不一致。"""
     return datetime.now(timezone.utc)
 
+class RoleEnum(enum.Enum):
+    ADMIN = "admin"
+    USER = "user"
+    SUPPORT = "support"
 
 
 def new_uuid() -> str:
     """生成字符串版 UUID，便于跨数据库兼容。"""
     return str(uuid4())
 
+class User(Base):
+    """用户表，承载用户信息。"""
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    username: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    email: Mapped[str| None] = mapped_column(String(128), unique=True, index=True, nullable=True)
+    phone: Mapped[str| None] = mapped_column(String(32), unique=True, index=True, nullable=True)
+    last_login_at: Mapped[datetime| None] = mapped_column(DateTime(timezone=True), nullable=True)
+    role: Mapped[RoleEnum] = mapped_column(
+        Enum(
+            RoleEnum,
+            name="role_enum",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        default=RoleEnum.USER,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+class UserSession(Base):
+    """用户会话表，承载用户会话信息。"""
+    __tablename__ = "user_sessions"
+    __table_args__ = (
+        Index("ix_user_sessions_refresh_token_hash", "refresh_token_hash", unique=True),
+        Index("ix_user_sessions_user_id_revoked_at_expires_at", "user_id", "revoked_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    refresh_token_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    revoked_at: Mapped[datetime| None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    last_used_at: Mapped[datetime| None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    user_agent: Mapped[str| None] = mapped_column(String(255), nullable=True)
+    ip_address: Mapped[str| None] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 class Ticket(Base):
     """工单主表，承载 L2 的“可执行动作”结果。"""
 
     __tablename__ = "tickets"
+    __table_args__ = (
+        Index("ix_tickets_created_at", "created_at"),
+        Index("ix_tickets_status_created_at", "status", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     public_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     creator: Mapped[str] = mapped_column(String(64), default="anonymous")
+    creator_user_id: Mapped[str] = mapped_column(String(36),ForeignKey("users.id"), index=True)
     assignee: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    assignee_user_id: Mapped[str | None] = mapped_column(String(36),ForeignKey("users.id"), index=True, nullable=True)
     department: Mapped[str] = mapped_column(String(64), default="IT")
     category: Mapped[str] = mapped_column(String(32), default="other")
     priority: Mapped[str] = mapped_column(String(8), default="P2")
@@ -89,8 +141,8 @@ class TicketComment(Base):
     )
 
     comment_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    ticket_id: Mapped[str] = mapped_column(String(36), ForeignKey("tickets.id", ondelete="CASCADE"))
-    actor_user_id: Mapped[str] = mapped_column(String(64), default="anonymous")
+    ticket_id: Mapped[str] = mapped_column(String(36), ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
+    actor_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -99,10 +151,14 @@ class PendingAction(Base):
     """待确认动作表，用于承载高风险工具的二次确认。"""
 
     __tablename__ = "pending_actions"
+    __table_args__ = (
+        Index("ix_pending_actions_status_expires_at", "status", "expires_at"),
+        Index("ix_pending_actions_user_id_status_expires_at", "user_id", "status", "expires_at"),
+    )
 
     confirm_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     tool_name: Mapped[str] = mapped_column(String(64), index=True)
     args_json: Mapped[dict] = mapped_column(JsonType, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
@@ -113,11 +169,17 @@ class KBQuery(Base):
     """问答记录表，承载一次完整的 `/ask` 执行轨迹。"""
 
     __tablename__ = "kb_queries"
+    __table_args__ = (
+        Index("ix_kb_queries_created_at", "created_at"),
+        Index("ix_kb_queries_user_name_created_at", "user_name", "created_at"),
+        Index("ix_kb_queries_department_created_at", "department", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     user_name: Mapped[str] = mapped_column(String(64), default="anonymous")
+    actor_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     department: Mapped[str] = mapped_column(String(64), default="general")
     question: Mapped[str] = mapped_column(Text)
     answer: Mapped[str] = mapped_column(Text)
@@ -135,10 +197,15 @@ class AuditLog(Base):
     """审计表，记录所有关键动作，满足 L2 的可追溯要求。"""
 
     __tablename__ = "audit_logs"
+    __table_args__ = (
+        Index("ix_audit_logs_created_at", "created_at"),
+        Index("ix_audit_logs_target_type_target_id_created_at", "target_type", "target_id", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     actor: Mapped[str] = mapped_column(String(64), default="anonymous")
+    actor_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     action_type: Mapped[str] = mapped_column(String(64), index=True)
     target_type: Mapped[str] = mapped_column(String(64))
     target_id: Mapped[str] = mapped_column(String(64))
@@ -150,13 +217,16 @@ class TicketDraft(Base):
     """工单草稿表，承载 L4 的“缺字段后续办”能力。"""
 
     __tablename__ = "ticket_drafts"
+    __table_args__ = (
+        Index("ix_ticket_drafts_expires_at", "expires_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     draft_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     creator: Mapped[str] = mapped_column(String(64), default="anonymous")
-    owner_user_id: Mapped[str] = mapped_column(String(64), default="anonymous", index=True)
+    owner_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     department: Mapped[str] = mapped_column(String(64), default="IT")
     payload_json: Mapped[dict] = mapped_column(JsonType, default=dict)
     missing_fields_json: Mapped[list] = mapped_column(JsonType, default=list)
@@ -166,17 +236,21 @@ class TicketDraft(Base):
 
 
 class AgentConversationMemory(Base):
-    """用户级短期对话记忆，只保存结构化引用与简短主题摘要。"""
+    """用户级短期会话记忆，保存近期引用、当前目标、未完成任务与压缩摘要。"""
 
     __tablename__ = "agent_conversation_memory"
 
-    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     last_ticket_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     last_draft_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     last_tool: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_topic_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_goal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_task_json: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    recent_turns_json: Mapped[list] = mapped_column(JsonType, default=list)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class UserMemory(Base):
@@ -184,7 +258,7 @@ class UserMemory(Base):
 
     __tablename__ = "user_memory"
 
-    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     default_location: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -11,10 +11,24 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import os
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from redis import Redis
 from sqlalchemy.orm import Session
 
-from src.api.deps import get_db, require_api_key
+from src.agent_graph import run_agent_graph
+from src.api import models
+from src.api.deps import get_db, get_redis_dep
+from src.api.deps_auth import get_current_active_user
+from src.api.rate_limit import (
+    RateLimitStoreError,
+    agent_limit,
+    agent_window_seconds,
+    consume_rate_limit,
+    extract_client_ip,
+    rate_limit_headers,
+)
 from src.api.schemas import AgentRequest, AgentResponse
 from src.api.services import run_agent_workflow
 
@@ -22,18 +36,59 @@ from src.api.services import run_agent_workflow
 router = APIRouter(tags=["agent"])
 
 
-@router.post("/agent", response_model=AgentResponse, dependencies=[Depends(require_api_key)])
-def agent(payload: AgentRequest, db: Session = Depends(get_db)) -> AgentResponse:
+def _role_value(role: object) -> str:
+    if hasattr(role, "value"):
+        return str(getattr(role, "value"))
+    return str(role or "")
+
+
+def _agent_engine() -> str:
+    """读取 `/agent` 执行引擎。默认沿用 legacy，便于灰度切换。"""
+    return str(os.getenv("AGENT_ENGINE", "legacy")).strip().lower()
+
+
+@router.post("/agent", response_model=AgentResponse)
+def agent(
+    payload: AgentRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_active_user),
+    redis: Redis = Depends(get_redis_dep),
+) -> AgentResponse:
     """执行最小 Agent 路由。"""
     try:
-        return run_agent_workflow(
+        decision = consume_rate_limit(
+            redis,
+            scope="agent:route",
+            subject=f"user:{current_user.id}|ip:{extract_client_ip(request)}",
+            limit=agent_limit(),
+            window_seconds=agent_window_seconds(),
+        )
+    except RateLimitStoreError as exc:
+        raise HTTPException(status_code=503, detail="rate_limit_store_unavailable") from exc
+
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="too_many_agent_requests",
+            headers=rate_limit_headers(decision),
+        )
+    for key, value in rate_limit_headers(decision).items():
+        response.headers[key] = value
+
+    try:
+        runner = run_agent_graph if _agent_engine() == "graph" else run_agent_workflow
+        return runner(
             db,
             text=payload.text,
-            user=payload.user,
+            user=str(current_user.username),
             department=payload.department,
             draft_id=payload.draft_id,
             fields=payload.fields,
             confirm_token=payload.confirm_token,
+            actor_user_id=str(current_user.id),
+            actor_role=_role_value(current_user.role),
         )
     except PermissionError as exc:
         raise HTTPException(status_code=404, detail="draft_not_found") from exc

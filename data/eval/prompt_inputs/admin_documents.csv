@@ -1,0 +1,9 @@
+doc_id,title,category,policy_type,doc_family,status,version,effective_date,family_id,authority_level,source_file,notes
+ADM-01,昆明百货大楼（集团）股份有限公司,admin,admin_general_policy,administration,active,v1.0,2013-06-24,ADM_MEETING_MANAGEMENT,company_policy,data/raw/行政/ADM-01昆明百货大楼（集团）股份有限公司.pdf,
+ADM-02,宏辉果蔬股份有限公司印章管理制度,admin,seal_management,seal_governance,active,v1.0,2025-03-19,ADM_SEAL_MANAGEMENT,company_policy,data/raw/行政/ADM-02宏辉果蔬股份有限公司印章管理制度.pdf,
+ADM-03,广东领益智造股份有限公司保密及档案管理制度,admin,confidentiality_policy,confidentiality_governance,active,v1.0,2025-10-01,ADM_CONFIDENTIALITY_POLICY,company_policy,data/raw/行政/ADM-03广东领益智造股份有限公司保密及档案管理制度.pdf,
+ADM-04,龙佰集团股份有限公司档案管理规定,admin,archive_management_policy,archive_governance,active,v1.0,2016-04-23,ADM_ARCHIVE_MANAGEMENT,company_policy,data/raw/行政/ADM-04龙佰集团股份有限公司档案管理规定.pdf,
+ADM-05,黑龙江北大荒农业股份有限公司固定资产管理制度,admin,asset_management,asset_lifecycle,active,v1.0,2018-10-22,ADM_ASSET_MANAGEMENT,company_policy,data/raw/行政/ADM-05黑龙江北大荒农业股份有限公司固定资产管理制度.pdf,
+ADM-06,四川西昌电力股份有限公司,admin,admin_general_policy,administration,active,v1.0,2012-11-23,ADM_ADMIN_GENERAL,company_policy,data/raw/行政/ADM-06四川西昌电力股份有限公司.pdf,
+ADM-07,广州市昊志机电股份有限公司采购招标管理制度,admin,procurement_policy,procurement_governance,active,v1.0,2022-05-01,ADM_PROCUREMENT_BIDDING,company_policy,data/raw/行政/ADM-07广州市昊志机电股份有限公司采购招标管理制度.pdf,
+ADM-08,渤海水业股份有限公司合同管理制度,admin,contract_management,contract_lifecycle,active,v1.0,2026-01-28,ADM_CONTRACT_MANAGEMENT,company_policy,data/raw/行政/ADM-08渤海水业股份有限公司合同管理制度.pdf,

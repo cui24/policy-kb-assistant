@@ -1,212 +1,207 @@
 # Policy KB Assistant
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+面向企业内部 IT 服务台场景的 RAG + Agent 工单助手。项目支持自然语言制度问答、ITSM-lite 工单创建与操作、多轮上下文记忆、审计追溯和轻量 CI 评测，覆盖从用户输入到工具执行、结果返回和质量门禁的完整链路。
 
-Enterprise KB + ITSM Agent. This project combines policy Q&A, ticket workflows, and MCP-exposed tools behind one governed execution layer.
+> 适合展示的关键词：RAG、AI Agent、LangGraph、FastAPI、Qdrant、BM25、RRF、Rerank、Tool Calling、MCP、Docker Compose、CI 自动化评测。
 
-The core design is intentional:
-- The model proposes a route or tool plan.
-- The backend validates schema, auth, and confirmation state.
-- Only validated actions execute, and every step is auditable.
+## 项目亮点
 
-Two practical differentiators:
-- The same skills registry drives both `/agent` and MCP tools.
-- High-risk actions use two-step confirmation instead of direct execution.
+- **完整业务链路**：`用户输入 -> 登录鉴权/限流 -> Agent 路由 -> RAG 问答/工单工具 -> 记忆更新 -> 审计追溯 -> CI 评测`。
+- **混合检索优化**：实现 Dense 向量检索 + BM25 关键词检索 + RRF 融合排序，并支持 CrossEncoder rerank 高质量模式。
+- **受约束 Agent 执行**：模型只负责生成路由或工具计划，后端统一做 schema 校验、权限校验、工具白名单、高风险二次确认和审计落库。
+- **ITSM-lite 工单能力**：支持一句话建单、缺字段草稿续办、查单、追加评论、催办、取消确认。
+- **多层记忆设计**：实现 L0-L4 记忆边界，支持“继续刚才的工单”“上一单”等多轮对话引用恢复。
+- **工程化交付**：Docker Compose 一键拉起 API、UI、Postgres、Redis、Qdrant、MCP 与 KB 初始化任务，并接入 GitHub Actions 质量门禁。
 
-## Prerequisites
+## 架构图
 
-- Python 3.10+
-- Conda or Miniconda is recommended for a clean local environment
-- `make` is recommended because the repository already ships a `Makefile`
-- Docker + Docker Compose are only required for the full demo path
+![总体架构图](assets/总体架构图.png)
 
-## What You Can Demo
+系统由 Streamlit UI、FastAPI API、LangGraph Agent、RAG 检索生成链路、工单服务层、PostgreSQL、Redis、Qdrant 和 MCP 服务组成。前端请求进入后端后，会先经过登录态校验和限流，再由 Agent 判断进入问答、建单、草稿续办或工单工具路径。
 
-- Policy Q&A with citations (the web UI routes natural-language requests through `POST /agent`; `POST /ask` remains available as a direct API endpoint)
-- One-shot agent routing via `POST /agent`
-- Ticket creation, lookup, comments, escalation, and cancellation
-- Streamlit web UI that calls the real HTTP API
-- MCP stdio server exposing governed ticket tools
-- Replay via `kb_queries` and `audit_logs`
+## 业务示例
 
-## Quickstart (Minimal Local Run)
+![业务示例图](assets/业务示例图.png)
 
-Use this path if you want the fastest local setup for tickets, the web UI, and MCP tools. It does not require Docker, Postgres, or Qdrant.
+典型用户路径包括：
 
-1. Install dependencies.
+- **制度问答**：用户提问企业内部制度，系统检索知识库片段，生成带引用出处的回答。
+- **一句话建单**：用户描述故障，Agent 抽取标题、描述、类别、优先级、地点、联系方式等字段，字段完整则创建工单，字段缺失则生成草稿等待补充。
+- **工单工具操作**：用户自然语言查单、追加说明、催办或取消工单；取消等高风险动作需要 `confirm_token` 二次确认。
+
+## RAG 问答链路
+
+![RAG问答链路图](assets/RAG问答链路图.png)
+
+RAG 链路分为召回、融合、重排序和生成四步：
+
+1. **Dense 检索**：使用 BGE embedding 从 Qdrant 召回语义相关片段。
+2. **BM25 检索**：基于文档 payload 构建关键词索引，补充企业内部专有名词、编号、系统名等精确匹配能力。
+3. **RRF 融合**：将向量召回和关键词召回结果按 Reciprocal Rank Fusion 融合排序，兼顾语义泛化和关键词命中。
+4. **CrossEncoder Rerank**：高质量模式下使用 `BAAI/bge-reranker-base` 对候选片段精排。
+5. **答案生成**：基于 TopK 证据生成结构化 JSON，包含答案、引用、证据和兜底拒答逻辑。
+
+## 量化效果
+
+完整 RAG 评测使用 `130` 条制度问答样例，对比纯 Dense、Hybrid RRF 和 Hybrid RRF + Rerank 三种模式。
+
+| 模式 | GoldDoc R@3 | GoldDoc R@5 | GoldDoc MRR | Auto APC | Citation Output | Refusal | Retrieve p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dense | 86.15% | 90.00% | 0.7955 | 40.63% | 86.15% | 14.62% | 211 ms |
+| Hybrid RRF | 93.08% | 96.15% | 0.8574 | 43.31% | 88.46% | 13.08% | 216 ms |
+| Hybrid RRF + Rerank | 96.92% | 97.69% | 0.9164 | 47.64% | 93.08% | 6.92% | 11192 ms |
+
+结论：
+
+- 默认实时模式采用 **Hybrid RRF**，在 p50 检索延迟仅增加约 `5 ms` 的情况下，将 GoldDoc R@5 从 `90.00%` 提升到 `96.15%`。
+- 高质量模式采用 **Hybrid RRF + Rerank**，GoldDoc R@5 达到 `97.69%`，GoldDoc MRR 达到 `0.9164`，但 CPU 环境下 CrossEncoder rerank 延迟较高，更适合作为离线评测或高质量模式。
+- 指标口径：GoldDoc R@K/MRR 是文档级命中指标，不等同于严格证据条款命中；Auto APC 是自动答案要点覆盖率，不等同于人工最终正确率；Citation Output 是引用输出率，不代表引用一定完全正确。
+
+轻量 CI 质量门禁：
+
+- 核心确定性测试：`10 passed`
+- Agent 工作流评测：`12` 条样例，Route Accuracy `91.7%`，工具执行 Error Count `0`
+- RAG fixture：GoldDoc R@3/R@5 `0.750`，GoldDoc MRR `0.625`，Citation Output Rate `0.750`
+
+## 核心功能
+
+### 1. Agent 意图路由
+
+- 基于 LangGraph 编排 Agent 主流程。
+- 规则路由覆盖建单、补充信息、确认操作、查单等高频固定场景。
+- 长尾或模糊表达可由 LLM Planner 生成执行计划。
+- Planner 输出不会直接执行，必须经过 Pydantic schema、工具白名单、权限与风险校验。
+
+### 2. 制度知识库问答
+
+- 支持自然语言问题输入。
+- 支持 Dense + BM25 + RRF 混合检索。
+- 支持 CrossEncoder rerank 精排。
+- 输出带 citations 的结构化答案。
+- 问答记录写入 `kb_queries`，并通过 `request_id` 关联审计日志。
+
+### 3. ITSM-lite 工单管理
+
+- 支持自然语言创建工单。
+- 支持缺必填字段时生成草稿，等待用户补充后转正。
+- 支持查单、追加评论、催办、取消。
+- 支持 `Idempotency-Key`，避免重复提交。
+- 高风险取消操作需要 `confirm_token` 二次确认。
+
+### 4. 分层记忆
+
+| 层级 | 名称 | 作用 |
+| --- | --- | --- |
+| L0 | Working Memory | 单次请求内保存 route、intent、抽取字段、工具结果、confirm_token 等临时状态 |
+| L1 | Session Memory | 保存当前会话目标、最近轮次、会话摘要和未完成任务 |
+| L2 | Task Memory | 保存工单草稿、待确认动作、任务进度等可恢复状态 |
+| L3 | User Memory | 保存低风险用户偏好，如默认地点、联系方式、部门等 |
+| L4 | Episodic Memory | 从问答记录、工单记录和审计日志中回放历史事件 |
+
+### 5. 审计追溯
+
+- 问答、建单、工单操作、MCP 工具调用都会写入审计日志。
+- 支持按 `request_id` 或 `ticket_id` 回查请求链路。
+- 可追溯用户输入、Agent 路由、工具动作、返回结果和错误原因。
+
+### 6. MCP 工具服务
+
+- 将工单能力封装为受约束工具：
+  - `lookup_ticket`
+  - `add_ticket_comment`
+  - `escalate_ticket`
+  - `cancel_ticket`
+- `/agent` 与 MCP tools 复用同一套服务层和工具校验逻辑。
+- 支持 HTTP MCP 与 stdio MCP 两种形态。
+
+## 技术栈
+
+- **前端**：Streamlit、httpx
+- **后端**：FastAPI、Pydantic、SQLAlchemy、Alembic
+- **Agent**：LangGraph、规则路由、LLM Planner、Tool Registry
+- **RAG**：Qdrant、sentence-transformers、BGE、rank-bm25、RRF、CrossEncoder Rerank
+- **数据与中间件**：PostgreSQL、Redis、Qdrant
+- **工程化**：Docker Compose、pytest、GitHub Actions、Makefile
+
+## 本地启动
+
+推荐使用 Docker Compose 启动完整环境。
+
+1. 准备环境变量：
 
 ```bash
-conda create -n policy-kb python=3.10 -y
-conda activate policy-kb
-python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-2. In `.env`, override these values for a SQLite-based local run.
-
-```dotenv
-DATABASE_URL=sqlite:///./policy_kb_l2.db
-POLICY_API_KEY=local-dev-key
-AUTO_MIGRATE_ON_STARTUP=true
-DEV_DB_FALLBACK_CREATE_ALL=false
-```
-
-3. Start the API.
-
-```bash
-make api
-```
-
-4. Start the web UI in another terminal.
-
-```bash
-make ui
-```
-
-5. Open the app.
-
-- Web UI: `http://localhost:8501`
-- API health: `http://localhost:8080/health`
-
-Use these UI values:
-- `API Base URL`: `http://localhost:8080`
-- `API Key`: `local-dev-key`
-- `User`: `alice`
-- `Department`: `IT`
-
-What works in this mode:
-- Manual ticket creation
-- Ticket lookup and management
-- Trace replay for created tickets
-- MCP ticket tools
-
-What is intentionally limited in this mode:
-- Knowledge-backed Q&A (`POST /ask` or `/agent` routed to `ASK`) needs a valid `OPENAI_API_KEY`
-- Retrieval-backed Q&A also needs Qdrant and ingested documents
-
-## Full Demo (Postgres + Qdrant + Document Ingestion)
-
-Use this path if you want the complete Q&A + ticket + audit demo.
-
-1. Start infrastructure.
-
-```bash
-make l2-up
-```
-
-This brings up:
-- Qdrant
-- Postgres
-- Redis
-
-2. Keep the default Postgres-style `DATABASE_URL` from `.env.example`, and set:
+至少填写：
 
 ```dotenv
 POLICY_API_KEY=local-dev-key
-OPENAI_API_KEY=YOUR_REAL_OPENAI_COMPATIBLE_KEY
+OPENAI_API_KEY=YOUR_OPENAI_COMPATIBLE_KEY
 ```
 
-3. The repository ships one redistributable demo document:
-
-- `data/demo/ACME_IT_Admin_Handbook_v1.0_Demo.pdf`
-
-Optional extra source documents are not redistributed. If you want them, download them into `data/raw/`:
+2. 启动开发环境：
 
 ```bash
-./scripts/download_pdfs.sh
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 ```
 
-`data/raw/` is git-ignored by default, so those extra documents stay local.
-
-4. Ingest the bundled demo document plus any local `data/raw/` PDFs into Qdrant.
+或使用 Makefile：
 
 ```bash
-make ingest
+make dev-up
 ```
 
-5. Start the API and UI.
+3. 打开服务：
+
+- UI：`http://localhost:8501`
+- API Docs：`http://localhost:8080/docs`
+- API Health：`http://localhost:8080/health`
+- Qdrant Dashboard：`http://localhost:6333/dashboard`
+
+4. 停止服务：
 
 ```bash
-make api
-make ui
+docker compose -f compose.yaml -f compose.dev.yaml down
 ```
 
-In this mode, you can demo:
-- KB-assisted `/agent` from the web UI
-- `POST /ask` if you want to call the API directly
-- Draft continuation
-- Existing-ticket tool actions
-- Web UI + MCP side by side
-
-For document provenance and optional source URLs, see [docs/demo_data.md](docs/demo_data.md).
-
-## MCP
-
-Run the stdio server in demo mode:
+## 常用命令
 
 ```bash
-export MCP_ACTOR_USER_ID=alice
-export MCP_DEPARTMENT=IT
-PYTHONPATH=$(pwd) python -m src.mcp_stdio_server
+# 启动开发版容器
+make dev-up
+
+# 停止开发版容器
+make dev-down
+
+# 查看 API 和 UI 日志
+docker compose -f compose.yaml -f compose.dev.yaml logs -f api ui
+
+# 容器内运行核心测试
+make ci-test
+
+# 容器内运行轻量质量门禁
+make ci-eval
+
+# 一次执行测试 + 质量门禁
+make ci-local
 ```
 
-You can also validate the MCP tool chain without any external host:
+## 仓库结构
 
-```bash
-PYTHONPATH=$(pwd) python scripts/mcp_smoke.py --actor alice
+```text
+src/api/          FastAPI 路由、鉴权、限流、服务层、数据库模型
+src/agent_graph/  LangGraph Agent 主流程与工作记忆
+src/kb/           文档入库、混合检索、答案生成
+src/mcp_wrapper/  MCP 工具封装与执行器
+src/ui/           Streamlit 前端
+alembic/          数据库迁移
+configs/          检索、模型和运行配置
+scripts/          评测、CI、数据处理和 smoke 脚本
+tests/            单元测试、服务测试、Agent/MCP 测试
+assets/           架构图和业务链路图
 ```
 
-## Security Model
+## 设计边界
 
-This repository implements a demo-grade safety model, not a production multi-tenant auth system.
-
-- `/agent` and write APIs use a shared `X-API-Key`
-- MCP stdio runs in fixed-actor mode via `MCP_ACTOR_USER_ID`
-- High-risk cancellation is two-step: request confirmation, then confirm
-- Audit entries record source information in payloads so Web and MCP calls are distinguishable
-
-Current non-goals:
-- OAuth
-- Per-user bearer-token auth
-- Remote HTTP MCP with multi-user identity mapping
-
-## Testing
-
-Run the local regression suite:
-
-```bash
-PYTHONPATH=$(pwd) pytest -q tests
-```
-
-The repository includes:
-- service-layer tests
-- API smoke tests
-- MCP in-memory tool tests
-- Streamlit UI smoke tests
-
-GitHub Actions runs the core regression subset on pushes and pull requests.
-
-## Troubleshooting
-
-- `401 Unauthorized`: set `POLICY_API_KEY` in `.env`, then use the same value in the UI sidebar.
-- `Qdrant connection refused`: the full demo path needs `make l2-up` before `make ingest` or KB-backed `/agent`.
-- No citations or empty KB answers: you likely skipped `make ingest`, or no valid `OPENAI_API_KEY` is configured.
-- MCP host cannot connect: in stdio mode, do not print to `stdout`; use `stderr` for logs.
-- FastAPI `on_event` deprecation warnings: known warning, not a runtime failure; migration to `lifespan` is a follow-up cleanup.
-
-## Repository Layout
-
-- `src/api/`: FastAPI app, services, skills registry, storage logic
-- `src/ui/`: Streamlit app and HTTP client
-- `src/kb/`: retrieval and answer generation
-- `src/agent/`: ticket extraction logic
-- `src/mcp_stdio_server.py`: MCP stdio entrypoint
-- `tests/`: regression coverage
-- `scripts/`: smoke and release helpers
-- `docs/`: public documentation
-
-## Documentation
-
-- [Architecture](docs/architecture.md)
-- [Demo Data](docs/demo_data.md)
-- [MCP](docs/mcp.md)
+这是一个求职展示型 AI 应用项目，重点是 RAG、Agent 工具调用、业务工作流、记忆、审计和工程化评测闭环。当前安全模型适合 demo 和内部原型，不等同于生产级多租户权限系统；如果进入生产环境，需要进一步补充企业 SSO、细粒度 RBAC、审计留存策略、敏感信息脱敏和模型调用成本治理。

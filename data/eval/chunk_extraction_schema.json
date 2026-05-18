@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Policy Chunk Extraction Record",
+  "type": "object",
+  "required": [
+    "doc_id",
+    "chunk_id",
+    "section_path",
+    "page_start",
+    "page_end",
+    "text",
+    "keywords",
+    "rule_type",
+    "effective_date",
+    "evidence_span"
+  ],
+  "properties": {
+    "doc_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "chunk_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "section_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "page_start": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "page_end": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "text": {
+      "type": "string",
+      "minLength": 30
+    },
+    "keywords": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "rule_type": {
+      "type": "string",
+      "enum": [
+        "fact",
+        "procedure",
+        "constraint",
+        "comparison",
+        "exception",
+        "multi_hop",
+        "definition",
+        "checklist"
+      ]
+    },
+    "effective_date": {
+      "type": "string"
+    },
+    "evidence_span": {
+      "type": "string",
+      "minLength": 8
+    }
+  },
+  "additionalProperties": true
+}

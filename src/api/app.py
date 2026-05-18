@@ -20,17 +20,23 @@ L2 API 入口：把 L0/L1 问答系统包装成可被业务系统调用的 FastA
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 
+from src.agent_graph.config import load_agent_graph_config
+from src.agent_graph.mcp_client import check_remote_mcp_health
 from src.api.deps import load_runtime_settings
 from src.api.migrations import ensure_schema_ready
 from src.api.routes.agent import router as agent_router
+from src.api.routes.auth import router as auth_router
 from src.api.routes.ask import router as ask_router
 from src.api.routes.history import router as history_router
 from src.api.routes.tickets import router as tickets_router
 
 
 load_runtime_settings()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Policy KB Assistant API",
@@ -42,6 +48,19 @@ app = FastAPI(
 def on_startup() -> None:
     """启动时优先执行 Alembic 迁移，确保表结构处于最新版本。"""
     ensure_schema_ready()
+    graph_config = load_agent_graph_config()
+    if graph_config.mcp_client_enabled and graph_config.mcp_check_on_startup:
+        ok, detail = check_remote_mcp_health(
+            server_url=graph_config.mcp_server_url,
+            timeout_seconds=graph_config.mcp_healthcheck_timeout_seconds,
+        )
+        if ok:
+            logger.info("Remote MCP health check passed: %s", detail)
+        else:
+            message = f"Remote MCP health check failed: {detail}"
+            if graph_config.mcp_startup_strict:
+                raise RuntimeError(message)
+            logger.warning("%s (non-strict mode, continue startup)", message)
 
 
 @app.get("/health")
@@ -54,3 +73,4 @@ app.include_router(ask_router)
 app.include_router(tickets_router)
 app.include_router(agent_router)
 app.include_router(history_router)
+app.include_router(auth_router)

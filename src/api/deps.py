@@ -15,9 +15,11 @@ from collections.abc import Generator
 
 from dotenv import load_dotenv
 from fastapi import Header, HTTPException
+from redis import Redis
 from sqlalchemy.orm import Session
 
 from src.api.db import SessionLocal
+from src.api.redis_client import get_redis
 
 
 
@@ -38,6 +40,11 @@ def get_db() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
+
+
+def get_redis_dep() -> Redis:
+    """提供全局 Redis 连接，供幂等/限流等依赖复用。"""
+    return get_redis()
 
 
 def expected_api_key() -> str:

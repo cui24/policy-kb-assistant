@@ -147,11 +147,12 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import AsyncIterator, Generator
 from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 
 _QUERY_SPLIT_MARKERS = (
@@ -523,6 +524,310 @@ def _build_extractive_fallback(
             }
         ],
     }
+
+
+def stream_answer_with_citations_official(
+    question: str,
+    evidence: list[dict[str, Any]],
+) -> Generator[dict[str, Any], None, dict[str, Any]]:
+    """
+    使用官方同步流式接口输出答案 token，并在结束后返回结构化结果。
+    该函数通过 `yield` 持续输出中间 token 事件，通过 `return` 返回最终结果。
+    """
+    load_dotenv()
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    api_key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL", "deepseek-chat")
+    level = os.getenv("APP_LEVEL", "l0")
+    cfg = load_level_config(level)
+    generation_cfg = cfg.get("generation", {})
+    max_snippet_chars = int(cfg["citations"]["max_snippet_chars"])
+    max_tokens = int(generation_cfg.get("max_tokens", 400))
+
+    if not evidence:
+        return _attach_meta(
+            {"answer": "证据不足：未检索到与问题相关的文档片段。", "citations": []},
+            json_ok=False,
+            repair_used=False,
+            failure_reason="no_evidence",
+            attempt_stage="short_circuit",
+        )
+    if not api_key:
+        return _attach_meta(
+            {"answer": "证据不足：缺少 OPENAI_API_KEY。", "citations": []},
+            json_ok=False,
+            repair_used=False,
+            failure_reason="missing_api_key",
+            attempt_stage="short_circuit",
+        )
+
+    evidence_lines = []
+    for idx, ev in enumerate(evidence, start=1):
+        doc_id = ev.get("doc_id")
+        page = ev.get("page")
+        snippet = str(ev.get("snippet") or ev.get("text", ""))[:max_snippet_chars]
+        evidence_lines.append(f"[E{idx}] doc_id={doc_id} page={page} snippet={snippet}")
+    evidence_block = "\n".join(evidence_lines)
+
+    system_prompt = (
+        "你是企业内部政策/手册问答助手。"
+        "你只能依据给定证据回答，禁止编造。"
+        "若证据不足，回答“证据不足”。"
+        "你必须输出严格 JSON（不要 Markdown，不要额外文字）。"
+        "输出必须以 { 开始，以 } 结束。"
+        "格式："
+        '{"answer":"...","citations":[{"doc_id":"...","page":1,"snippet":"..."}]}'
+        "如果答案不是“证据不足”，citations 至少 1 条。"
+        "其中 citations.snippet 必须来自证据原文，可截断。"
+    )
+    user_prompt = (
+        f"问题：{question}\n\n"
+        f"证据片段：\n{evidence_block}\n\n"
+        "请按要求输出 JSON。"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+    reasoning_content = ""
+    content = ""
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True,
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+    except Exception as exc:
+        return _attach_meta(
+            {"answer": "证据不足：模型调用失败。", "citations": []},
+            json_ok=False,
+            repair_used=False,
+            failure_reason=f"llm_call_failed:{exc.__class__.__name__}",
+            attempt_stage="stream_failed",
+        )
+
+    for chunk in response:
+        if not getattr(chunk, "choices", None):
+            continue
+        delta = getattr(chunk.choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        reasoning_piece = getattr(delta, "reasoning_content", None)
+        if reasoning_piece:
+            reasoning_text = str(reasoning_piece)
+            reasoning_content += reasoning_text
+            yield {"event": "reasoning_token", "delta": reasoning_text}
+            continue
+
+        content_piece = getattr(delta, "content", None)
+        if content_piece:
+            content_text = str(content_piece)
+            content += content_text
+            yield {"event": "token", "delta": content_text}
+
+    data = _extract_json(content)
+    if isinstance(data, dict) and "answer" in data:
+        normalized = _normalize_output(data, evidence, max_snippet_chars)
+        is_valid, failure_reason = _validate_output(normalized)
+        if is_valid:
+            return _attach_meta(
+                normalized,
+                json_ok=True,
+                repair_used=False,
+                failure_reason=None,
+                attempt_stage="primary_stream",
+            )
+        return _attach_meta(
+            {"answer": "证据不足：模型流式结果结构不合法。", "citations": []},
+            json_ok=False,
+            repair_used=False,
+            failure_reason=failure_reason or "invalid_stream_output",
+            attempt_stage="stream_invalid",
+        )
+
+    fallback = answer_with_citations(question, evidence)
+    fallback_meta = dict(fallback.get("meta") or {})
+    fallback_meta["failure_reason"] = fallback_meta.get("failure_reason") or "stream_parse_failed"
+    fallback["meta"] = fallback_meta
+    return fallback
+
+
+async def answer_with_citations_async(
+    question: str,
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """异步问答入口：线程池复用同步稳定逻辑。"""
+    import asyncio
+
+    return await asyncio.to_thread(answer_with_citations, question, evidence)
+
+
+async def stream_answer_with_citations_official_async(
+    question: str,
+    evidence: list[dict[str, Any]],
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    使用官方异步流式接口输出 token，并在结束后产出 final_result 事件。
+
+    事件格式：
+    - token / reasoning_token: {"event": "...", "delta": "..."}
+    - final_result: {"event": "final_result", "result": {...}}
+    """
+    load_dotenv()
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    api_key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL", "deepseek-chat")
+    level = os.getenv("APP_LEVEL", "l0")
+    cfg = load_level_config(level)
+    generation_cfg = cfg.get("generation", {})
+    max_snippet_chars = int(cfg["citations"]["max_snippet_chars"])
+    max_tokens = int(generation_cfg.get("max_tokens", 400))
+
+    if not evidence:
+        yield {
+            "event": "final_result",
+            "result": _attach_meta(
+                {"answer": "证据不足：未检索到与问题相关的文档片段。", "citations": []},
+                json_ok=False,
+                repair_used=False,
+                failure_reason="no_evidence",
+                attempt_stage="short_circuit",
+            ),
+        }
+        return
+    if not api_key:
+        yield {
+            "event": "final_result",
+            "result": _attach_meta(
+                {"answer": "证据不足：缺少 OPENAI_API_KEY。", "citations": []},
+                json_ok=False,
+                repair_used=False,
+                failure_reason="missing_api_key",
+                attempt_stage="short_circuit",
+            ),
+        }
+        return
+
+    evidence_lines = []
+    for idx, ev in enumerate(evidence, start=1):
+        doc_id = ev.get("doc_id")
+        page = ev.get("page")
+        snippet = str(ev.get("snippet") or ev.get("text", ""))[:max_snippet_chars]
+        evidence_lines.append(f"[E{idx}] doc_id={doc_id} page={page} snippet={snippet}")
+    evidence_block = "\n".join(evidence_lines)
+
+    system_prompt = (
+        "你是企业内部政策/手册问答助手。"
+        "你只能依据给定证据回答，禁止编造。"
+        "若证据不足，回答“证据不足”。"
+        "你必须输出严格 JSON（不要 Markdown，不要额外文字）。"
+        "输出必须以 { 开始，以 } 结束。"
+        "格式："
+        '{"answer":"...","citations":[{"doc_id":"...","page":1,"snippet":"..."}]}'
+        "如果答案不是“证据不足”，citations 至少 1 条。"
+        "其中 citations.snippet 必须来自证据原文，可截断。"
+    )
+    user_prompt = (
+        f"问题：{question}\n\n"
+        f"证据片段：\n{evidence_block}\n\n"
+        "请按要求输出 JSON。"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+    content_parts: list[str] = []
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True,
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+    except Exception as exc:
+        yield {
+            "event": "final_result",
+            "result": _attach_meta(
+                {"answer": "证据不足：模型调用失败。", "citations": []},
+                json_ok=False,
+                repair_used=False,
+                failure_reason=f"llm_call_failed:{exc.__class__.__name__}",
+                attempt_stage="stream_failed",
+            ),
+        }
+        return
+
+    async for chunk in response:
+        if not getattr(chunk, "choices", None):
+            continue
+        delta = getattr(chunk.choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        reasoning_piece = getattr(delta, "reasoning_content", None)
+        if reasoning_piece:
+            reasoning_text = str(reasoning_piece)
+            yield {"event": "reasoning_token", "delta": reasoning_text}
+            continue
+
+        content_piece = getattr(delta, "content", None)
+        if content_piece:
+            content_text = str(content_piece)
+            content_parts.append(content_text)
+            yield {"event": "token", "delta": content_text}
+
+    content = "".join(content_parts)
+    data = _extract_json(content)
+    if isinstance(data, dict) and "answer" in data:
+        normalized = _normalize_output(data, evidence, max_snippet_chars)
+        is_valid, failure_reason = _validate_output(normalized)
+        if is_valid:
+            yield {
+                "event": "final_result",
+                "result": _attach_meta(
+                    normalized,
+                    json_ok=True,
+                    repair_used=False,
+                    failure_reason=None,
+                    attempt_stage="primary_stream_async",
+                ),
+            }
+            return
+        yield {
+            "event": "final_result",
+            "result": _attach_meta(
+                {"answer": "证据不足：模型流式结果结构不合法。", "citations": []},
+                json_ok=False,
+                repair_used=False,
+                failure_reason=failure_reason or "invalid_stream_output",
+                attempt_stage="stream_invalid",
+            ),
+        }
+        return
+
+    fallback = await answer_with_citations_async(question, evidence)
+    fallback_meta = dict(fallback.get("meta") or {})
+    fallback_meta["failure_reason"] = fallback_meta.get("failure_reason") or "stream_parse_failed"
+    fallback["meta"] = fallback_meta
+    yield {"event": "final_result", "result": fallback}
 
 
 def answer_with_citations(

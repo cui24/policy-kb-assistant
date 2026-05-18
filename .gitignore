@@ -1,38 +1,68 @@
-# local env / secrets
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# 环境变量
 .env
-*.env
-!.env.example
 
-# local editor / session state
-.specstory/
-.cursor/mcp.json
-
-# runtime data / generated outputs
-logs/
-outputs/
-tmp/
-qdrant_storage/
+# Local runtime data
 *.db
 *.sqlite
 *.sqlite3
-*:Zone.Identifier
+policy_kb_l*.db
 
-# public demo data may live under data/demo/
-# local-only or user-supplied docs stay under data/raw/
-data/raw/
-data/cache/
-data/processed/
-docs/archive/
-
-# python
-__pycache__/
-*.pyc
+# Generated outputs and caches
+outputs/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
-.venv/
-.ipynb_checkpoints/
 
-# misc OS noise
-.DS_Store
+# Local/private working notes
+.codex
+.codex/
+.cursor/
+.cursorindexingignore
+.specstory/
+cui24.github.io/
+study_test/
+current-freeze.txt
+
+# Personal learning notes and intermediate writeups
+README_AUTH_LOGIN_UI_UPGRADE.zh-CN.md
+README_LANGGRAPH_DFS.zh-CN.md
+README_REDIS_IDEMPOTENCY_RATE_LIMIT_PROGRESS.zh-CN.md
+docs/DEMO_SCRIPT_MEMORY.zh-CN.md
+docs/PLAN_*.zh-CN.md
+docs/README_MEMORY_*.zh-CN.md
+docs/README_MODULE_*.zh-CN.md
+docs/README_PORTFOLIO.zh-CN.md
+docs/README_PROJECT_LEARNING_MAP.zh-CN.md
+docs/README_PROJECT_NAVIGATION.zh-CN.md
+docs/archive/
+
+# Temporary scratch files accidentally generated during analysis
+/\,out)*
+/=3,*
+/=5,*
+/\ \ \ \ print(r)
+/for r in rows[:80]:
+/print(rank
+/PY
+train.py
+
+# Large or generated local datasets
+data/raw/
+data/extracted/

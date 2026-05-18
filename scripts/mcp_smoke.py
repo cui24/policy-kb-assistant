@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP in-process smoke test：不依赖 Host，直接验证 stdio server 的核心工具链。"""
+"""MCP in-process smoke test：不依赖 Host，直接验证主工具集合。"""
 
 from __future__ import annotations
 
@@ -68,8 +68,14 @@ def _payload_from_result(result) -> dict:
     return json.loads(text_payload or "{}")
 
 
+def _extract_data(payload: dict) -> dict:
+    if isinstance(payload.get("data"), dict):
+        return dict(payload["data"])
+    return dict(payload or {})
+
+
 async def _run_smoke(*, actor: str, department: str) -> int:
-    """构建 in-memory MCP server 并顺序验证全部工具。"""
+    """构建 in-memory MCP server 并验证主工具可见性与基础查单能力。"""
     session_factory = _build_test_session_factory()
     ticket_id = _seed_ticket(session_factory, actor)
     app = build_mcp_server(
@@ -82,58 +88,26 @@ async def _run_smoke(*, actor: str, department: str) -> int:
         tools_result = await client.list_tools()
         tool_names = sorted(tool.name for tool in tools_result.tools)
         print("[TOOLS]", ", ".join(tool_names))
+        expected_tools = {
+            "ask_policy",
+            "create_ticket",
+            "continue_ticket_draft",
+            "confirm_action",
+            "ticket_tool_planner",
+            "get_ticket_detail",
+        }
+        missing = sorted(expected_tools - set(tool_names))
+        assert not missing, f"missing tools: {missing}"
 
-        lookup_payload = _payload_from_result(
-            await client.call_tool("lookup_ticket", {"ticket_id": ticket_id})
+        detail_payload = _payload_from_result(
+            await client.call_tool("get_ticket_detail", {"ticket_id": ticket_id})
         )
-        print("[LOOKUP]", json.dumps(lookup_payload, ensure_ascii=False))
+        print("[GET_TICKET_DETAIL]", json.dumps(detail_payload, ensure_ascii=False))
+        assert str(detail_payload.get("contract_version") or "") == "v1"
+        assert bool(detail_payload.get("success")) is True
+        detail_data = _extract_data(detail_payload)
+        assert str(detail_data.get("ticket_id") or "") == ticket_id
 
-        comment_payload = _payload_from_result(
-            await client.call_tool(
-                "add_ticket_comment",
-                {
-                    "ticket_id": ticket_id,
-                    "comment": "补充说明：今晚 8 点后可到宿舍排查。",
-                },
-            )
-        )
-        print("[COMMENT]", json.dumps(comment_payload, ensure_ascii=False))
-
-        escalate_payload = _payload_from_result(
-            await client.call_tool(
-                "escalate_ticket",
-                {
-                    "ticket_id": ticket_id,
-                    "reason": "已影响今晚作业提交。",
-                },
-            )
-        )
-        print("[ESCALATE]", json.dumps(escalate_payload, ensure_ascii=False))
-
-        request_cancel_payload = _payload_from_result(
-            await client.call_tool(
-                "request_cancel_ticket",
-                {
-                    "ticket_id": ticket_id,
-                    "reason": "已自行恢复。",
-                },
-            )
-        )
-        print("[REQUEST_CANCEL]", json.dumps(request_cancel_payload, ensure_ascii=False))
-
-        confirm_cancel_payload = _payload_from_result(
-            await client.call_tool(
-                "confirm_cancel_ticket",
-                {
-                    "confirm_token": str(request_cancel_payload["confirm_token"]),
-                },
-            )
-        )
-        print("[CONFIRM_CANCEL]", json.dumps(confirm_cancel_payload, ensure_ascii=False))
-
-    final_ticket = confirm_cancel_payload["ticket_detail"]
-    assert final_ticket["ticket_id"] == ticket_id
-    assert final_ticket["status"] == "cancelled"
     print("[PASS] MCP smoke test completed successfully.")
     return 0
 

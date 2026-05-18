@@ -1,0 +1,54 @@
+services:
+  api:
+    command:
+      [
+        "uvicorn",
+        "src.api.app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080",
+        "--reload",
+        "--reload-dir",
+        "/app/src",
+      ]
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - .:/app
+      - model_cache:/root/.cache
+
+  kb-init:
+    volumes:
+      - .:/app
+      - model_cache:/root/.cache
+
+  mcp:
+    command:
+      [
+        "watchfiles",
+        "--filter",
+        "python",
+        "python -m src.mcp_http_server",
+        "/app/src",
+      ]
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - .:/app
+      - model_cache:/root/.cache
+
+  ui:
+    command:
+      [
+        "streamlit",
+        "run",
+        "src/ui/app.py",
+        "--server.address=0.0.0.0",
+        "--server.port=8501",
+        "--server.headless=true",
+        "--browser.gatherUsageStats=false",
+        "--server.fileWatcherType=poll",
+      ]
+    volumes:
+      - .:/app

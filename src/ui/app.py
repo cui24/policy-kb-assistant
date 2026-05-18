@@ -57,8 +57,8 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -230,11 +230,22 @@ def _render_header() -> None:
 
 def _ensure_state() -> None:
     """初始化页面交互需要的 session_state 键。"""
+    env_base_url = str(os.getenv("POLICY_API_BASE_URL") or "").strip() or "http://localhost:8080"
     defaults = {
-        "api_base_url": "http://localhost:8080",
+        "api_base_url": env_base_url,
         "ui_api_key": "",
-        "ui_user": "alice",
         "ui_department": "IT",
+        "active_page": "Agent 主页",
+        "auth_access_token": "",
+        "auth_user_profile": None,
+        "auth_login_identifier": "",
+        "auth_login_password": "",
+        "auth_register_username": "",
+        "auth_register_password": "",
+        "auth_register_email": "",
+        "auth_register_phone": "",
+        "clear_auth_login_password_next": False,
+        "clear_auth_register_password_next": False,
         "agent_input": "",
         "ask_input": "",
         "last_error": None,
@@ -262,54 +273,162 @@ def _ensure_state() -> None:
         if key not in st.session_state:
             st.session_state[key] = value
 
+    # 避免在 widget 已创建后直接改同 key：改为下一轮渲染前统一清空密码。
+    if st.session_state.get("clear_auth_login_password_next"):
+        st.session_state["auth_login_password"] = ""
+        st.session_state["clear_auth_login_password_next"] = False
+    if st.session_state.get("clear_auth_register_password_next"):
+        st.session_state["auth_register_password"] = ""
+        st.session_state["clear_auth_register_password_next"] = False
+
+    # 若历史会话仍是 localhost 且环境变量已给出容器内地址，则自动矫正一次。
+    current_base_url = str(st.session_state.get("api_base_url") or "").strip()
+    if current_base_url == "http://localhost:8080" and env_base_url != "http://localhost:8080":
+        st.session_state["api_base_url"] = env_base_url
 
 
-def _render_sidebar() -> tuple[str, str, str, PolicyAPIClient]:
-    """渲染侧边栏配置，并创建 API 客户端。"""
-    with st.sidebar:
-        st.header("API 设置")
-        base_url = st.text_input(
-            "L2 API Base URL",
-            value=st.session_state.get("api_base_url", "http://localhost:8080"),
-            key="api_base_url",
-        ).strip()
-        user_name = st.text_input(
-            "默认用户",
-            value=st.session_state.get("ui_user", "alice"),
-            key="ui_user",
-        ).strip()
-        api_key = st.text_input(
-            "API Key（写接口必填）",
-            value=st.session_state.get("ui_api_key", ""),
-            key="ui_api_key",
-            type="password",
-        ).strip()
-        department = st.text_input(
-            "默认部门",
-            value=st.session_state.get("ui_department", "IT"),
-            key="ui_department",
-        ).strip()
 
-        client = PolicyAPIClient(base_url=base_url, api_key=api_key or None)
+def _get_auth_user_profile() -> dict[str, Any] | None:
+    """返回当前登录用户；若 token 或 profile 缺失则视为未登录。"""
+    token = str(st.session_state.get("auth_access_token") or "").strip()
+    profile = st.session_state.get("auth_user_profile")
+    if token and isinstance(profile, dict):
+        return profile
+    return None
 
-        if st.button("检测 API", use_container_width=True, key="check_api_health"):
-            try:
-                st.session_state["last_api_health"] = client.health()
-                st.session_state["last_error"] = None
-                st.session_state["last_error_context"] = None
-            except APIClientError as exc:
-                st.session_state["last_api_health"] = None
-                _set_error("API 健康检查", exc)
 
-        health_info = st.session_state.get("last_api_health")
-        if isinstance(health_info, dict):
-            st.success(
-                f"API 可用：status={health_info.get('status')} · stage={health_info.get('stage')}"
+def _build_client() -> PolicyAPIClient:
+    """按当前会话状态创建 API 客户端。"""
+    base_url = str(st.session_state.get("api_base_url") or "http://localhost:8080").strip()
+    api_key = str(st.session_state.get("ui_api_key") or "").strip()
+    access_token = str(st.session_state.get("auth_access_token") or "").strip()
+    return PolicyAPIClient(
+        base_url=base_url,
+        api_key=api_key or None,
+        access_token=access_token or None,
+    )
+
+
+def _logout_user() -> None:
+    """清理登录态并回到登录页。"""
+    st.session_state["auth_access_token"] = ""
+    st.session_state["auth_user_profile"] = None
+    st.session_state["auth_login_password"] = ""
+    st.session_state["auth_register_password"] = ""
+    st.session_state["active_draft_id"] = ""
+    st.session_state["active_draft_missing_fields"] = []
+    st.session_state["active_page"] = "Agent 主页"
+    _clear_error()
+    st.rerun()
+
+
+def _render_auth_page(client: PolicyAPIClient) -> None:
+    """渲染登录/注册页；登录成功后进入 Agent 主页。"""
+    st.subheader("登录 / 注册")
+    st.caption("请先登录后再进入 Agent、手动问答、工单管理和审计页面。")
+    _render_error_card()
+
+    login_tab, register_tab = st.tabs(["登录", "注册"])
+
+    with login_tab:
+        with st.form("login_form"):
+            identifier = st.text_input("用户名 / 邮箱 / 手机号", key="auth_login_identifier").strip()
+            password = st.text_input("密码", type="password", key="auth_login_password")
+            submitted = st.form_submit_button("登录", use_container_width=True)
+
+        if submitted:
+            if not identifier or not password:
+                st.warning("请输入登录标识和密码。")
+            else:
+                try:
+                    auth_result = client.login(identifier=identifier, password=password)
+                except APIClientError as exc:
+                    _set_error("调用 /auth/login", exc)
+                else:
+                    token = str(auth_result.get("access_token") or "").strip()
+                    profile = auth_result.get("user")
+                    if not token or not isinstance(profile, dict):
+                        st.error("登录响应缺少 access_token 或 user 字段。")
+                    else:
+                        st.session_state["auth_access_token"] = token
+                        st.session_state["auth_user_profile"] = profile
+                        st.session_state["clear_auth_login_password_next"] = True
+                        st.session_state["active_page"] = "Agent 主页"
+                        client.set_access_token(token)
+                        _clear_error()
+                        st.success("登录成功，正在跳转主页。")
+                        st.rerun()
+
+    with register_tab:
+        with st.form("register_form"):
+            register_username = st.text_input("用户名", key="auth_register_username").strip()
+            register_password = st.text_input(
+                "密码（至少 8 位）",
+                type="password",
+                key="auth_register_password",
             )
-        else:
-            st.caption("建议先点击“检测 API”，确认 `make api` 已启动。")
+            register_email = st.text_input("邮箱（可选）", key="auth_register_email").strip()
+            register_phone = st.text_input("手机号（可选）", key="auth_register_phone").strip()
+            submitted = st.form_submit_button("注册并登录", use_container_width=True)
 
-    return base_url, user_name or "anonymous", department or "general", client
+        if submitted:
+            if not register_username or not register_password:
+                st.warning("请至少填写用户名和密码。")
+            else:
+                try:
+                    auth_result = client.register(
+                        username=register_username,
+                        password=register_password,
+                        email=register_email or None,
+                        phone=register_phone or None,
+                    )
+                except APIClientError as exc:
+                    _set_error("调用 /auth/register", exc)
+                else:
+                    token = str(auth_result.get("access_token") or "").strip()
+                    profile = auth_result.get("user")
+                    if not token or not isinstance(profile, dict):
+                        st.error("注册响应缺少 access_token 或 user 字段。")
+                    else:
+                        st.session_state["auth_access_token"] = token
+                        st.session_state["auth_user_profile"] = profile
+                        st.session_state["clear_auth_register_password_next"] = True
+                        st.session_state["active_page"] = "Agent 主页"
+                        client.set_access_token(token)
+                        _clear_error()
+                        st.success("注册成功，正在跳转主页。")
+                        st.rerun()
+
+
+def _render_navigation_sidebar(client: PolicyAPIClient, auth_profile: dict[str, Any]) -> str:
+    """渲染登录后侧栏导航。"""
+    with st.sidebar:
+        st.header("导航")
+        selected_page = st.radio(
+            "选择页面",
+            options=["Agent 主页", "手动问答", "手动建单", "工单管理", "审计追溯"],
+            key="active_page",
+        )
+
+        st.divider()
+        role = str(auth_profile.get("role") or "user")
+        username = str(auth_profile.get("username") or "")
+        st.caption(f"当前用户：{username} ({role})")
+
+        if st.button("刷新身份", use_container_width=True, key="refresh_auth_me"):
+            try:
+                profile = client.me()
+            except APIClientError as exc:
+                _set_error("调用 /auth/me", exc)
+            else:
+                st.session_state["auth_user_profile"] = profile
+                _clear_error()
+                st.success("身份信息已刷新。")
+
+        if st.button("退出登录", use_container_width=True, key="logout_user"):
+            _logout_user()
+
+    return selected_page
 
 
 
@@ -595,19 +714,18 @@ def _handle_agent_submit(client: PolicyAPIClient, text: str, user_name: str, dep
 
 
 def _handle_ask_submit(client: PolicyAPIClient, question: str, user_name: str, department: str) -> None:
-    """执行“仅问答”入口，但仍统一经 `/agent` 路由。"""
+    """执行手动问答入口，直接调用 `/ask`。"""
     _clear_error()
     try:
-        result = client.agent(text=question, user=user_name, department=department)
+        result = client.ask(question=question, user=user_name, department=department)
     except APIClientError as exc:
-        _set_error("调用 /agent（问答路径）", exc)
+        _set_error("调用 /ask（手动问答）", exc)
         return
 
-    st.session_state["last_ask"] = None
-    st.session_state["last_agent"] = result
-    kb_response = result.get("kb") or {}
-    if isinstance(kb_response, dict) and kb_response.get("request_id"):
-        st.session_state["trace_request_id"] = str(kb_response.get("request_id"))
+    st.session_state["last_agent"] = None
+    st.session_state["last_ask"] = result
+    if isinstance(result, dict) and result.get("request_id"):
+        st.session_state["trace_request_id"] = str(result.get("request_id"))
 
 
 
@@ -821,7 +939,12 @@ def _load_trace_bundle(
 
 
 
-def _render_draft_continue_form(client: PolicyAPIClient, user_name: str, department: str) -> None:
+def _render_draft_continue_form(
+    client: PolicyAPIClient,
+    user_name: str,
+    department: str,
+    is_authenticated: bool,
+) -> None:
     """渲染草稿补全表单，让 NEED_MORE_INFO 可以直接续办。"""
     active_draft_id = str(st.session_state.get("active_draft_id") or "")
     if not active_draft_id:
@@ -843,9 +966,16 @@ def _render_draft_continue_form(client: PolicyAPIClient, user_name: str, departm
             key="draft_followup_note",
             height=80,
         )
-        submitted = st.form_submit_button("继续提交草稿", use_container_width=True)
+        submitted = st.form_submit_button(
+            "继续提交草稿",
+            use_container_width=True,
+            disabled=not is_authenticated,
+        )
 
     if submitted:
+        if not is_authenticated:
+            st.warning("请先登录后再继续提交草稿。")
+            return
         if not location.strip() and not contact.strip() and not note.strip():
             st.warning("请至少补充一个字段或一段补充说明。")
         else:
@@ -861,7 +991,12 @@ def _render_draft_continue_form(client: PolicyAPIClient, user_name: str, departm
 
 
 
-def _render_manual_ticket_form(client: PolicyAPIClient, user_name: str, department: str) -> None:
+def _render_manual_ticket_form(
+    client: PolicyAPIClient,
+    user_name: str,
+    department: str,
+    is_authenticated: bool,
+) -> None:
     """渲染手动建单表单。"""
     st.subheader("手动建单（直接调用 /tickets）")
     with st.form("manual_ticket_form"):
@@ -879,9 +1014,16 @@ def _render_manual_ticket_form(client: PolicyAPIClient, user_name: str, departme
             location = st.text_input("地点（会写入 context.location）", value="金明校区")
             priority = st.selectbox("优先级", options=TICKET_PRIORITY_OPTIONS, index=1)
 
-        submitted = st.form_submit_button("创建工单", use_container_width=True)
+        submitted = st.form_submit_button(
+            "创建工单",
+            use_container_width=True,
+            disabled=not is_authenticated,
+        )
 
     if submitted:
+        if not is_authenticated:
+            st.warning("请先登录后再创建工单。")
+            return
         if not title.strip() or not description.strip():
             st.warning("标题和描述不能为空。")
         else:
@@ -934,7 +1076,7 @@ def _render_ticket_detail_card(ticket: dict[str, Any]) -> None:
 
 
 
-def _render_ticket_manager(client: PolicyAPIClient, user_name: str) -> None:
+def _render_ticket_manager(client: PolicyAPIClient, user_name: str, is_authenticated: bool) -> None:
     """渲染工单列表、详情和状态更新。"""
     st.subheader("工单管理")
 
@@ -988,7 +1130,15 @@ def _render_ticket_manager(client: PolicyAPIClient, user_name: str) -> None:
 
     with detail_right:
         new_status = st.selectbox("更新状态为", options=TICKET_STATUS_OPTIONS, index=0)
-        if st.button("提交状态更新", use_container_width=True, key="update_ticket_status"):
+        if st.button(
+            "提交状态更新",
+            use_container_width=True,
+            key="update_ticket_status",
+            disabled=not is_authenticated,
+        ):
+            if not is_authenticated:
+                st.warning("请先登录后再更新工单状态。")
+                return
             if not manual_ticket_id:
                 st.warning("请先选择或输入工单号。")
             else:
@@ -1071,6 +1221,118 @@ def _render_trace_explorer(client: PolicyAPIClient) -> None:
     _render_audit_timeline(st.session_state.get("trace_audit_logs") or [])
 
 
+def _render_agent_home_page(
+    client: PolicyAPIClient,
+    user_name: str,
+    department: str,
+    is_authenticated: bool,
+) -> None:
+    """渲染 Agent 主页。"""
+    _render_error_card()
+    example_text = _render_example_runner()
+    if example_text:
+        st.session_state["agent_input"] = example_text
+
+    st.subheader("Agent 主页")
+    agent_text = st.text_area(
+        "输入一句话描述",
+        height=130,
+        placeholder="例如：我宿舍网络连不上，帮我提交报修工单。地点金明校区，手机号138xxxx。",
+        key="agent_input",
+    )
+
+    run_agent = st.button(
+        "调用 /agent",
+        type="primary",
+        use_container_width=True,
+        disabled=not is_authenticated,
+        key="run_agent_home",
+    )
+    if run_agent:
+        text = agent_text.strip()
+        if not text:
+            st.warning("请先输入一句话描述。")
+        else:
+            with st.spinner("正在调用 /agent ..."):
+                _handle_agent_submit(client, text, user_name, department)
+
+    agent_response = st.session_state.get("last_agent")
+    if isinstance(agent_response, dict):
+        if str(agent_response.get("route") or "") == "ASK":
+            st.subheader("问答结果（经 /agent 路由）")
+        else:
+            st.subheader("一句话结果（/agent）")
+        _render_agent_response(agent_response)
+    else:
+        st.info("提交一句话后，这里会展示 /agent 返回结果。")
+
+    _render_draft_continue_form(client, user_name, department, is_authenticated=is_authenticated)
+
+
+def _render_manual_qa_page(
+    client: PolicyAPIClient,
+    user_name: str,
+    department: str,
+    is_authenticated: bool,
+) -> None:
+    """渲染手动问答页。"""
+    _render_error_card()
+    st.subheader("手动问答（直接调用 /ask）")
+    question = st.text_area(
+        "输入问题",
+        key="ask_input",
+        height=130,
+        placeholder="例如：统一身份认证的登录地址是什么？",
+    )
+
+    submitted = st.button(
+        "调用 /ask",
+        use_container_width=True,
+        type="primary",
+        disabled=not is_authenticated,
+        key="run_manual_qa",
+    )
+    if submitted:
+        normalized_question = question.strip()
+        if not normalized_question:
+            st.warning("请先输入问题。")
+        else:
+            with st.spinner("正在调用 /ask ..."):
+                _handle_ask_submit(client, normalized_question, user_name, department)
+
+    ask_result = st.session_state.get("last_ask")
+    if isinstance(ask_result, dict):
+        _render_kb_response(ask_result)
+    else:
+        st.info("提交问题后，这里会显示手动问答结果。")
+
+
+def _render_manual_ticket_page(
+    client: PolicyAPIClient,
+    user_name: str,
+    department: str,
+    is_authenticated: bool,
+) -> None:
+    """渲染手动建单页。"""
+    _render_error_card()
+    _render_manual_ticket_form(client, user_name, department, is_authenticated=is_authenticated)
+
+
+def _render_ticket_management_page(
+    client: PolicyAPIClient,
+    user_name: str,
+    is_authenticated: bool,
+) -> None:
+    """渲染工单管理页。"""
+    _render_error_card()
+    _render_ticket_manager(client, user_name, is_authenticated=is_authenticated)
+
+
+def _render_audit_page(client: PolicyAPIClient) -> None:
+    """渲染审计追溯页。"""
+    _render_error_card()
+    _render_trace_explorer(client)
+
 
 def main() -> None:
     """渲染网页入口并驱动 UI -> API 的最小可用闭环。"""
@@ -1084,74 +1346,32 @@ def main() -> None:
     _inject_styles()
     _render_header()
 
-    base_url, user_name, department, client = _render_sidebar()
+    client = _build_client()
+    auth_user = _get_auth_user_profile()
+    is_authenticated = auth_user is not None
 
-    left_col, right_col = st.columns([1.55, 1.05], gap="large")
+    if not is_authenticated:
+        _render_auth_page(client)
+        return
 
-    with left_col:
-        _render_error_card()
+    assert isinstance(auth_user, dict)
+    selected_page = _render_navigation_sidebar(client, auth_user)
 
-        example_text = _render_example_runner()
-        if example_text:
-            st.session_state["agent_input"] = example_text
-            st.session_state["ask_input"] = example_text
+    user_name = "anonymous"
+    if isinstance(auth_user, dict):
+        user_name = str(auth_user.get("username") or "anonymous")
+    department = str(auth_user.get("department") or st.session_state.get("ui_department") or "IT")
 
-        st.subheader("一句话入口（默认走 /agent）")
-        agent_text = st.text_area(
-            "输入一句话描述",
-            height=130,
-            placeholder="例如：我宿舍网络连不上，帮我提交报修工单。地点金明校区，手机号138xxxx。",
-            key="agent_input",
-        )
-
-        agent_left, agent_right = st.columns(2)
-        with agent_left:
-            run_agent = st.button("调用 /agent", type="primary", use_container_width=True)
-        with agent_right:
-            run_ask = st.button("仅问答（走 /agent）", use_container_width=True)
-
-        if run_agent:
-            text = agent_text.strip()
-            if not text:
-                st.warning("请先输入一句话描述。")
-            else:
-                with st.spinner("正在调用 /agent ..."):
-                    t0 = time.time()
-                    _handle_agent_submit(client, text, user_name, department)
-                    t1 = time.time()
-                st.caption(f"本次前端请求耗时：{t1 - t0:.2f}s · base_url={base_url}")
-
-        if run_ask:
-            question = str(st.session_state.get("ask_input") or agent_text or "").strip()
-            if not question:
-                st.warning("请先输入问题。")
-            else:
-                with st.spinner("正在调用 /agent（问答路径）..."):
-                    t0 = time.time()
-                    _handle_ask_submit(client, question, user_name, department)
-                    t1 = time.time()
-                st.caption(f"本次前端请求耗时：{t1 - t0:.2f}s · base_url={base_url}")
-
-        agent_response = st.session_state.get("last_agent")
-
-        if isinstance(agent_response, dict):
-            if str(agent_response.get("route") or "") == "ASK":
-                st.subheader("问答结果（经 /agent 路由）")
-            else:
-                st.subheader("一句话结果（/agent）")
-            _render_agent_response(agent_response)
-        else:
-            st.info("点击“调用 /agent”或“仅问答（走 /agent）”后，这里会展示真实后端返回的结果。")
-
-        _render_draft_continue_form(client, user_name, department)
-
-        st.divider()
-        _render_manual_ticket_form(client, user_name, department)
-
-    with right_col:
-        _render_ticket_manager(client, user_name)
-        st.divider()
-        _render_trace_explorer(client)
+    if selected_page == "Agent 主页":
+        _render_agent_home_page(client, user_name, department, is_authenticated=is_authenticated)
+    elif selected_page == "手动问答":
+        _render_manual_qa_page(client, user_name, department, is_authenticated=is_authenticated)
+    elif selected_page == "手动建单":
+        _render_manual_ticket_page(client, user_name, department, is_authenticated=is_authenticated)
+    elif selected_page == "工单管理":
+        _render_ticket_management_page(client, user_name, is_authenticated=is_authenticated)
+    else:
+        _render_audit_page(client)
 
 
 if __name__ == "__main__":

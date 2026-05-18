@@ -1,0 +1,6 @@
+# 8GB 显存推荐优先级（按“快 -> 平衡 -> 质量”）
+BAAI/bge-small-zh-v1.5
+BAAI/bge-base-zh-v1.5
+BAAI/bge-large-zh-v1.5
+moka-ai/m3e-base
+

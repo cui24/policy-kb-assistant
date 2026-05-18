@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections.abc import AsyncGenerator, Generator
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -41,7 +42,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.agent.ticket_extractor import extract_ticket_payload
-from src.api import crud, models
+from src.api import ask_pipeline, crud, models
 from src.api import planner
 from src.api.planner import PlannerError
 from src.api.schemas import (
@@ -56,8 +57,13 @@ from src.api.schemas import (
     ToolPlan,
 )
 from src.api.skills import get_ticket_tool_registry, list_global_planner_skills, list_ticket_tool_skills
-from src.kb.answer import answer_with_citations
-from src.kb.retrieve import retrieve
+from src.kb.answer import (
+    answer_with_citations,
+    answer_with_citations_async,
+    stream_answer_with_citations_official,
+    stream_answer_with_citations_official_async,
+)
+from src.kb.retrieve import retrieve, retrieve_async
 
 
 _TICKET_ROUTE_KEYWORDS = (
@@ -93,6 +99,8 @@ _TICKET_COMMENT_FETCH_LIMIT = 20
 _AUDIT_COMMENT_PREVIEW_LIMIT = 160
 _ADMIN_ACTORS = {"admin", "service_admin"}
 _SHORT_TERM_MEMORY_SUMMARY_LIMIT = 160
+_SESSION_MEMORY_TURN_SUMMARY_LIMIT = 120
+_SESSION_MEMORY_RECENT_TURN_LIMIT = 5
 _SHORT_TERM_TICKET_REFERENCE_MARKERS = (
     "上一单",
     "上一张单",
@@ -101,7 +109,10 @@ _SHORT_TERM_TICKET_REFERENCE_MARKERS = (
     "那张单",
     "之前那个",
     "上次那个",
+    "上次报的",
+    "我上次报的",
     "刚建的单",
+    "刚才那张",
     "那单",
 )
 _SHORT_TERM_DRAFT_REFERENCE_MARKERS = (
@@ -116,6 +127,29 @@ _SHORT_TERM_DRAFT_REFERENCE_MARKERS = (
 )
 _LONG_TERM_MEMORY_SUMMARY_LIMIT = 120
 
+
+
+def _role_value(role: object | None) -> str:
+    """把枚举/对象角色统一转成小写字符串。"""
+    if hasattr(role, "value"):
+        return str(getattr(role, "value") or "").strip().lower()
+    return str(role or "").strip().lower()
+
+
+def _is_admin_like(actor_role: str | None, actor: str) -> bool:
+    """判断当前操作者是否具备管理员级权限。"""
+    role_value = _role_value(actor_role)
+    if role_value in {"admin", "support"}:
+        return True
+    return (actor or "").strip() in _ADMIN_ACTORS
+
+
+def _resolve_actor_user_id(actor_user_id: str | None, actor: str) -> str:
+    """统一解析本次动作的 user_id，优先使用登录态主键。"""
+    normalized_user_id = str(actor_user_id or "").strip()
+    if normalized_user_id:
+        return normalized_user_id
+    return str(actor or "").strip() or "anonymous"
 
 
 def _utc_now() -> datetime:
@@ -359,18 +393,68 @@ def run_ask_workflow(
     question: str,
     user: str | None = None,
     department: str | None = None,
+    actor_user_id: str | None = None,
 ) -> dict:
     """执行一次完整的 L2 问答，并把问答轨迹落库。"""
+    request_id = ask_pipeline.new_request_id()
+    actor = user or "anonymous"
+    actor_department = department or "general"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
+
+    hits, retrieve_ms = ask_pipeline.run_retrieve_step(question)
+    output, answer_ms = ask_pipeline.run_answer_step(question, hits)
+    normalized = ask_pipeline.normalize_answer_payload(
+        output=output,
+        hits=hits,
+        retrieve_ms=retrieve_ms,
+        answer_ms=answer_ms,
+    )
+
+    kb_query = ask_pipeline.persist_kb_query(
+        db,
+        request_id=request_id,
+        actor=actor,
+        actor_user_id=resolved_actor_user_id,
+        department=actor_department,
+        question=question,
+        normalized=normalized,
+    )
+    ask_pipeline.write_ask_audit(
+        db,
+        actor=actor,
+        actor_user_id=resolved_actor_user_id,
+        request_id=request_id,
+        target_query_id=kb_query.id,
+        question=question,
+        department=actor_department,
+        normalized=normalized,
+    )
+    return ask_pipeline.build_kb_result(
+        request_id=request_id,
+        query_id=kb_query.id,
+        normalized=normalized,
+    )
+
+
+async def run_ask_workflow_async(
+    db: Session,
+    question: str,
+    user: str | None = None,
+    department: str | None = None,
+    actor_user_id: str | None = None,
+) -> dict:
+    """执行一次完整的异步 ASK 工作流，并把问答轨迹落库。"""
     request_id = _new_request_id()
     actor = user or "anonymous"
     actor_department = department or "general"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
 
     retrieve_start = time.perf_counter()
-    hits = retrieve(question)
+    hits = await retrieve_async(question)
     retrieve_end = time.perf_counter()
 
     answer_start = time.perf_counter()
-    output = answer_with_citations(question, hits)
+    output = await answer_with_citations_async(question, hits)
     answer_end = time.perf_counter()
 
     retrieve_ms = int((retrieve_end - retrieve_start) * 1000)
@@ -380,11 +464,12 @@ def run_ask_workflow(
     output_meta = output.get("meta", {}) or {}
     trace_hits = _trim_hits_for_trace(hits)
 
-    kb_query = crud.create_kb_query(
+    kb_query = await crud.create_kb_query_async(
         db,
         {
             "request_id": request_id,
             "user_name": actor,
+            "actor_user_id": resolved_actor_user_id,
             "department": actor_department,
             "question": question,
             "answer": str(output.get("answer") or ""),
@@ -399,10 +484,11 @@ def run_ask_workflow(
         },
     )
 
-    crud.create_audit_log(
+    await crud.create_audit_log_async(
         db,
         {
             "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
             "action_type": "ASK",
             "target_type": "KB_QUERY",
             "target_id": kb_query.id,
@@ -434,6 +520,245 @@ def run_ask_workflow(
     }
 
 
+def run_ask_workflow_stream(
+    db: Session,
+    question: str,
+    user: str | None = None,
+    department: str | None = None,
+    actor_user_id: str | None = None,
+) -> Generator[dict, None, None]:
+    """执行一次流式 ASK：边输出 token，结束后返回结构化结果并落库。"""
+    request_id = _new_request_id()
+    actor = user or "anonymous"
+    actor_department = department or "general"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
+
+    yield {"event": "status", "data": {"stage": "started", "request_id": request_id}}
+
+    retrieve_start = time.perf_counter()
+    hits = retrieve(question)
+    retrieve_ms = int((time.perf_counter() - retrieve_start) * 1000)
+    yield {
+        "event": "status",
+        "data": {
+            "stage": "retrieve_done",
+            "request_id": request_id,
+            "hit_count": len(hits),
+            "latency_ms": retrieve_ms,
+        },
+    }
+
+    answer_start = time.perf_counter()
+    stream = stream_answer_with_citations_official(question, hits)
+    output: dict | None = None
+    while True:
+        try:
+            event_payload = next(stream)
+        except StopIteration as stop:
+            output = stop.value
+            break
+
+        event_name = str(event_payload.get("event") or "")
+        if event_name not in {"token", "reasoning_token"}:
+            continue
+        delta = str(event_payload.get("delta") or "")
+        if not delta:
+            continue
+        yield {"event": event_name, "data": {"delta": delta}}
+
+    answer_ms = int((time.perf_counter() - answer_start) * 1000)
+    if not isinstance(output, dict):
+        output = {
+            "answer": "证据不足：模型未返回有效结果。",
+            "citations": [],
+            "meta": {
+                "attempt_stage": "stream_empty",
+                "json_ok": False,
+                "repair_used": False,
+                "failure_reason": "stream_no_final",
+            },
+        }
+
+    citations = output.get("citations", []) or []
+    output_meta = output.get("meta", {}) or {}
+    trace_hits = _trim_hits_for_trace(hits)
+
+    kb_query = crud.create_kb_query(
+        db,
+        {
+            "request_id": request_id,
+            "user_name": actor,
+            "actor_user_id": resolved_actor_user_id,
+            "department": actor_department,
+            "question": question,
+            "answer": str(output.get("answer") or ""),
+            "citations_json": citations,
+            "retrieve_topk_json": trace_hits,
+            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+            "latency_retrieve_ms": retrieve_ms,
+            "latency_answer_ms": answer_ms,
+            "model": _model_name(),
+            "valid_json": bool(output_meta.get("json_ok", False)),
+            "failure_reason": output_meta.get("failure_reason"),
+        },
+    )
+
+    crud.create_audit_log(
+        db,
+        {
+            "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
+            "action_type": "ASK",
+            "target_type": "KB_QUERY",
+            "target_id": kb_query.id,
+            "request_id": request_id,
+            "payload_json": {
+                "question": question,
+                "department": actor_department,
+                "attempt_stage": output_meta.get("attempt_stage"),
+                "top_hit": trace_hits[0] if trace_hits else None,
+                "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+                "failure_reason": output_meta.get("failure_reason"),
+                "streamed": True,
+            },
+        },
+    )
+
+    result = {
+        "request_id": request_id,
+        "query_id": kb_query.id,
+        "answer": str(output.get("answer") or ""),
+        "citations": citations,
+        "meta": {
+            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+            "valid_json": bool(output_meta.get("json_ok", False)),
+            "repair_used": bool(output_meta.get("repair_used", False)),
+            "failure_reason": output_meta.get("failure_reason"),
+            "retrieve_topk": trace_hits,
+            "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+        },
+    }
+    yield {"event": "final", "data": public_kb_response(result)}
+    yield {"event": "done", "data": {"ok": True, "request_id": request_id}}
+
+
+async def run_ask_workflow_stream_async(
+    db: Session,
+    question: str,
+    user: str | None = None,
+    department: str | None = None,
+    actor_user_id: str | None = None,
+) -> AsyncGenerator[dict, None]:
+    """执行一次异步流式 ASK：边输出 token，结束后返回结构化结果并落库。"""
+    request_id = _new_request_id()
+    actor = user or "anonymous"
+    actor_department = department or "general"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
+
+    yield {"event": "status", "data": {"stage": "started", "request_id": request_id}}
+
+    retrieve_start = time.perf_counter()
+    hits = await retrieve_async(question)
+    retrieve_ms = int((time.perf_counter() - retrieve_start) * 1000)
+    yield {
+        "event": "status",
+        "data": {
+            "stage": "retrieve_done",
+            "request_id": request_id,
+            "hit_count": len(hits),
+            "latency_ms": retrieve_ms,
+        },
+    }
+
+    answer_start = time.perf_counter()
+    output: dict | None = None
+    async for event_payload in stream_answer_with_citations_official_async(question, hits):
+        event_name = str(event_payload.get("event") or "")
+        if event_name in {"token", "reasoning_token"}:
+            delta = str(event_payload.get("delta") or "")
+            if delta:
+                yield {"event": event_name, "data": {"delta": delta}}
+            continue
+        if event_name == "final_result":
+            raw_result = event_payload.get("result")
+            if isinstance(raw_result, dict):
+                output = raw_result
+
+    answer_ms = int((time.perf_counter() - answer_start) * 1000)
+    if not isinstance(output, dict):
+        output = {
+            "answer": "证据不足：模型未返回有效结果。",
+            "citations": [],
+            "meta": {
+                "attempt_stage": "stream_empty",
+                "json_ok": False,
+                "repair_used": False,
+                "failure_reason": "stream_no_final",
+            },
+        }
+
+    citations = output.get("citations", []) or []
+    output_meta = output.get("meta", {}) or {}
+    trace_hits = _trim_hits_for_trace(hits)
+
+    kb_query = await crud.create_kb_query_async(
+        db,
+        {
+            "request_id": request_id,
+            "user_name": actor,
+            "actor_user_id": resolved_actor_user_id,
+            "department": actor_department,
+            "question": question,
+            "answer": str(output.get("answer") or ""),
+            "citations_json": citations,
+            "retrieve_topk_json": trace_hits,
+            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+            "latency_retrieve_ms": retrieve_ms,
+            "latency_answer_ms": answer_ms,
+            "model": _model_name(),
+            "valid_json": bool(output_meta.get("json_ok", False)),
+            "failure_reason": output_meta.get("failure_reason"),
+        },
+    )
+
+    await crud.create_audit_log_async(
+        db,
+        {
+            "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
+            "action_type": "ASK",
+            "target_type": "KB_QUERY",
+            "target_id": kb_query.id,
+            "request_id": request_id,
+            "payload_json": {
+                "question": question,
+                "department": actor_department,
+                "attempt_stage": output_meta.get("attempt_stage"),
+                "top_hit": trace_hits[0] if trace_hits else None,
+                "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+                "failure_reason": output_meta.get("failure_reason"),
+                "streamed": True,
+            },
+        },
+    )
+
+    result = {
+        "request_id": request_id,
+        "query_id": kb_query.id,
+        "answer": str(output.get("answer") or ""),
+        "citations": citations,
+        "meta": {
+            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+            "valid_json": bool(output_meta.get("json_ok", False)),
+            "repair_used": bool(output_meta.get("repair_used", False)),
+            "failure_reason": output_meta.get("failure_reason"),
+            "retrieve_topk": trace_hits,
+            "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+        },
+    }
+    yield {"event": "final", "data": public_kb_response(result)}
+    yield {"event": "done", "data": {"ok": True, "request_id": request_id}}
+
 
 def public_kb_response(kb_result: dict) -> dict:
     """去掉仅供服务内部使用的字段，避免把内部主键直接暴露给外部调用方。"""
@@ -456,14 +781,17 @@ def create_ticket_workflow(
     source_draft_id: str | None = None,
     request_id: str | None = None,
     audit_action: str = "CREATE_TICKET",
+    actor_user_id: str | None = None,
 ) -> dict:
     """创建工单并写审计日志。"""
     actor = creator or "anonymous"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     ticket = crud.create_ticket(
         db,
         {
             "public_id": _new_ticket_public_id(),
             "creator": actor,
+            "creator_user_id": resolved_actor_user_id,
             "assignee": None,
             "department": department or "IT",
             "category": category,
@@ -482,6 +810,7 @@ def create_ticket_workflow(
         db,
         {
             "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
             "action_type": audit_action,
             "target_type": "TICKET",
             "target_id": ticket.public_id,
@@ -499,7 +828,8 @@ def create_ticket_workflow(
     ticket_context = context or {}
     _update_user_memory_from_ticket_facts(
         db,
-        actor,
+        actor=actor,
+        actor_user_id=resolved_actor_user_id,
         location=ticket_context.get("location"),
         contact=contact,
         source_ticket_id=ticket.public_id,
@@ -710,6 +1040,7 @@ def _with_audit_source(payload_json: dict | None, audit_source: str | None = Non
 def _audit_plan_event(
     db: Session,
     actor: str,
+    actor_user_id: str | None,
     action_type: str,
     ticket_id: str,
     request_id: str,
@@ -720,6 +1051,7 @@ def _audit_plan_event(
         db,
         {
             "actor": actor,
+            "actor_user_id": _resolve_actor_user_id(actor_user_id, actor),
             "action_type": action_type,
             "target_type": "TICKET",
             "target_id": ticket_id,
@@ -732,6 +1064,7 @@ def _audit_plan_event(
 def _audit_global_plan_event(
     db: Session,
     actor: str,
+    actor_user_id: str | None,
     action_type: str,
     target_type: str,
     target_id: str,
@@ -743,6 +1076,7 @@ def _audit_global_plan_event(
         db,
         {
             "actor": actor,
+            "actor_user_id": _resolve_actor_user_id(actor_user_id, actor),
             "action_type": action_type,
             "target_type": target_type,
             "target_id": target_id,
@@ -792,6 +1126,7 @@ def _extract_missing_fields_from_validation_error(exc: ValidationError) -> list[
 def _append_audit_log_uncommitted(
     db: Session,
     actor: str,
+    actor_user_id: str | None,
     action_type: str,
     target_type: str,
     target_id: str,
@@ -801,6 +1136,7 @@ def _append_audit_log_uncommitted(
     """在当前事务里追加审计日志，但不立即提交，便于多步动作原子完成。"""
     record = models.AuditLog(
         actor=actor,
+        actor_user_id=_resolve_actor_user_id(actor_user_id, actor),
         action_type=action_type,
         target_type=target_type,
         target_id=target_id,
@@ -811,10 +1147,45 @@ def _append_audit_log_uncommitted(
     return record
 
 
-def _memory_enabled_for_actor(actor: str) -> bool:
+def _memory_enabled_for_actor(actor_user_id: str) -> bool:
     """只有明确登录用户才启用短期记忆，避免 anonymous 共享状态。"""
-    normalized_actor = (actor or "").strip()
-    return bool(normalized_actor and normalized_actor != "anonymous")
+    normalized_actor_user_id = (actor_user_id or "").strip()
+    return bool(normalized_actor_user_id and normalized_actor_user_id != "anonymous")
+
+
+def _session_memory_ttl_minutes() -> int:
+    """读取 L1 会话记忆有效期，默认 120 分钟。"""
+    raw_value = os.getenv("SESSION_MEMORY_TTL_MINUTES", "120")
+    try:
+        minutes = int(raw_value)
+    except ValueError:
+        minutes = 120
+    return max(10, min(minutes, 24 * 60))
+
+
+def _session_memory_expiry() -> datetime:
+    """计算 L1 会话记忆过期时间。"""
+    return _utc_now() + timedelta(minutes=_session_memory_ttl_minutes())
+
+
+def _session_memory_expired(record) -> bool:
+    """判断 L1 会话记忆是否已过期。"""
+    if record is None:
+        return False
+    expires_at = _normalize_datetime(getattr(record, "expires_at", None))
+    if expires_at is None:
+        return False
+    return expires_at <= _utc_now()
+
+
+def _safe_json_dict(value) -> dict:
+    """把 JSON 字段安全归一成 dict。"""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _safe_json_list(value) -> list:
+    """把 JSON 字段安全归一成 list。"""
+    return list(value) if isinstance(value, list) else []
 
 
 def _serialize_agent_conversation_memory(record) -> dict:
@@ -826,6 +1197,14 @@ def _serialize_agent_conversation_memory(record) -> dict:
         "last_draft_id": str(record.last_draft_id or "") or None,
         "last_tool": str(record.last_tool or "") or None,
         "last_topic_summary": str(record.last_topic_summary or "") or None,
+        "current_goal": str(getattr(record, "current_goal", None) or "") or None,
+        "pending_task": _safe_json_dict(getattr(record, "pending_task_json", None)),
+        "recent_turns": _safe_json_list(getattr(record, "recent_turns_json", None)),
+        "expires_at": (
+            _normalize_datetime(getattr(record, "expires_at", None)).isoformat()
+            if _normalize_datetime(getattr(record, "expires_at", None)) is not None
+            else None
+        ),
         "updated_at": record.updated_at.isoformat() if record.updated_at is not None else None,
     }
 
@@ -842,19 +1221,21 @@ def _serialize_user_memory(record) -> dict:
     }
 
 
-def _load_short_term_memory(db: Session, actor: str) -> dict:
+def _load_short_term_memory(db: Session, actor_user_id: str) -> dict:
     """按当前用户读取短期对话记忆。"""
-    if not _memory_enabled_for_actor(actor):
+    if not _memory_enabled_for_actor(actor_user_id):
         return {}
-    record = crud.get_agent_conversation_memory(db, actor)
+    record = crud.get_agent_conversation_memory(db, actor_user_id)
+    if _session_memory_expired(record):
+        return {}
     return _serialize_agent_conversation_memory(record)
 
 
-def _load_user_memory(db: Session, actor: str) -> dict:
+def _load_user_memory(db: Session, actor_user_id: str) -> dict:
     """按当前用户读取长期默认资料。"""
-    if not _memory_enabled_for_actor(actor):
+    if not _memory_enabled_for_actor(actor_user_id):
         return {}
-    record = crud.get_user_memory(db, actor)
+    record = crud.get_user_memory(db, actor_user_id)
     return _serialize_user_memory(record)
 
 
@@ -898,30 +1279,151 @@ def _infer_draft_id_from_memory(
     return None
 
 
+def _memory_text_summary(text: str) -> str:
+    """生成 L1 最近轮次的用户输入摘要。"""
+    normalized = " ".join(str(text or "").split())
+    return normalized[:_SESSION_MEMORY_TURN_SUMMARY_LIMIT]
+
+
+def _ticket_id_from_response(response: dict | None) -> str | None:
+    """从 Agent 响应里提取可作为最近引用的工单号。"""
+    normalized = response or {}
+    for key in ("ticket", "ticket_detail"):
+        payload = normalized.get(key)
+        if isinstance(payload, dict):
+            ticket_id = str(payload.get("ticket_id") or "").strip()
+            if ticket_id:
+                return ticket_id
+    return None
+
+
+def _draft_payload_from_response(response: dict | None) -> dict:
+    """从 Agent 响应里提取草稿载荷。"""
+    draft_payload = (response or {}).get("draft")
+    return dict(draft_payload) if isinstance(draft_payload, dict) else {}
+
+
+def _current_goal_from_route(route: str, response: dict | None) -> str | None:
+    """根据最终 route 生成短期会话目标。"""
+    normalized_route = str(route or "")
+    if normalized_route == "ASK":
+        return "政策问答/制度咨询"
+    if normalized_route == "NEED_MORE_INFO":
+        return "补全信息后创建工单"
+    if normalized_route == "CREATE_TICKET":
+        return "工单已创建"
+    if normalized_route in {"LOOKUP_TICKET", "ADD_TICKET_COMMENT", "ESCALATE_TICKET"}:
+        return "跟进已有工单"
+    if normalized_route == "NEED_CONFIRMATION":
+        return "等待用户确认高风险操作"
+    if normalized_route == "CANCEL_TICKET":
+        return "工单已取消"
+    if normalized_route in {"DRAFT_EXPIRED", "DRAFT_NOT_FOUND"}:
+        return "草稿不可继续"
+    if normalized_route == "PLAN_REJECTED":
+        return "请求未执行"
+    if (response or {}).get("missing_fields"):
+        return "补全缺失信息"
+    return None
+
+
+def _pending_task_from_response(route: str, response: dict | None) -> dict | None:
+    """根据最终响应构建 L1 未完成任务摘要。"""
+    normalized_response = response or {}
+    normalized_route = str(route or "")
+    draft_payload = _draft_payload_from_response(normalized_response)
+    draft_id = str(draft_payload.get("draft_id") or "").strip()
+    draft_status = str(draft_payload.get("status") or "").strip()
+    missing_fields = list(normalized_response.get("missing_fields") or draft_payload.get("missing_fields") or [])
+
+    if normalized_route == "NEED_MORE_INFO" and draft_id and draft_status == "open":
+        return {
+            "type": "ticket_draft",
+            "draft_id": draft_id,
+            "missing_fields": missing_fields,
+            "updated_from_route": normalized_route,
+        }
+
+    confirm_token = str(normalized_response.get("confirm_token") or "").strip()
+    if normalized_route == "NEED_CONFIRMATION":
+        return {
+            "type": "pending_confirmation",
+            "confirm_token_prefix": confirm_token[:8] if confirm_token else None,
+            "updated_from_route": normalized_route,
+        }
+
+    if normalized_route == "NEED_MORE_INFO" and missing_fields:
+        return {
+            "type": "missing_fields",
+            "missing_fields": missing_fields,
+            "updated_from_route": normalized_route,
+        }
+
+    return None
+
+
+def _append_recent_turn(
+    recent_turns: list,
+    *,
+    text: str,
+    route: str,
+    response: dict | None,
+) -> list[dict]:
+    """追加并裁剪 L1 最近轮次压缩摘要。"""
+    normalized_response = response or {}
+    item = {
+        "role": "user",
+        "summary": _memory_text_summary(text),
+        "route": str(route or ""),
+    }
+    ticket_id = _ticket_id_from_response(normalized_response)
+    if ticket_id:
+        item["ticket_id"] = ticket_id
+    draft_payload = _draft_payload_from_response(normalized_response)
+    draft_id = str(draft_payload.get("draft_id") or "").strip()
+    if draft_id:
+        item["draft_id"] = draft_id
+    missing_fields = list(normalized_response.get("missing_fields") or draft_payload.get("missing_fields") or [])
+    if missing_fields:
+        item["missing_fields"] = missing_fields
+    existing = [turn for turn in _safe_json_list(recent_turns) if isinstance(turn, dict)]
+    existing.append(item)
+    return existing[-_SESSION_MEMORY_RECENT_TURN_LIMIT:]
+
+
 def _update_short_term_memory_from_response(
     db: Session,
-    actor: str,
+    actor_user_id: str,
     text: str,
     response: dict | None,
 ) -> None:
     """根据本轮响应回写短期记忆，保存最近的 ticket/draft 引用。"""
-    if not _memory_enabled_for_actor(actor):
+    if not _memory_enabled_for_actor(actor_user_id):
         return
 
-    current = _serialize_agent_conversation_memory(crud.get_agent_conversation_memory(db, actor))
+    current_record = crud.get_agent_conversation_memory(db, actor_user_id)
+    current = {} if _session_memory_expired(current_record) else _serialize_agent_conversation_memory(current_record)
     normalized_response = response or {}
     route = str(normalized_response.get("route") or "")
-    ticket_payload = normalized_response.get("ticket") or {}
-    draft_payload = normalized_response.get("draft") or {}
+    draft_payload = _draft_payload_from_response(normalized_response)
 
     updates = {
         "last_ticket_id": current.get("last_ticket_id"),
         "last_draft_id": current.get("last_draft_id"),
         "last_tool": route or current.get("last_tool"),
         "last_topic_summary": (text or "")[:_SHORT_TERM_MEMORY_SUMMARY_LIMIT] or current.get("last_topic_summary"),
+        "current_goal": _current_goal_from_route(route, normalized_response) or current.get("current_goal"),
+        "pending_task_json": _pending_task_from_response(route, normalized_response),
+        "recent_turns_json": _append_recent_turn(
+            list(current.get("recent_turns") or []),
+            text=text,
+            route=route,
+            response=normalized_response,
+        ),
+        "expires_at": _session_memory_expiry(),
     }
 
-    ticket_id = str(ticket_payload.get("ticket_id") or "").strip()
+    ticket_id = str(_ticket_id_from_response(normalized_response) or "").strip()
     if ticket_id:
         updates["last_ticket_id"] = ticket_id
 
@@ -932,12 +1434,15 @@ def _update_short_term_memory_from_response(
             updates["last_draft_id"] = draft_id
         elif draft_status in {"consumed", "completed", "expired"}:
             updates["last_draft_id"] = None
-    elif route == "DRAFT_EXPIRED":
+    elif route in {"DRAFT_EXPIRED", "DRAFT_NOT_FOUND"}:
         updates["last_draft_id"] = None
+
+    if route in {"CREATE_TICKET", "CANCEL_TICKET", "DRAFT_EXPIRED", "DRAFT_NOT_FOUND"}:
+        updates["pending_task_json"] = None
 
     crud.upsert_agent_conversation_memory(
         db,
-        actor,
+        actor_user_id,
         **updates,
     )
 
@@ -945,13 +1450,14 @@ def _update_short_term_memory_from_response(
 def _update_user_memory_from_ticket_facts(
     db: Session,
     actor: str,
+    actor_user_id: str,
     *,
     location: str | None = None,
     contact: str | None = None,
     source_ticket_id: str | None = None,
 ) -> None:
     """根据最新建单事实更新用户长期默认资料。"""
-    if not _memory_enabled_for_actor(actor):
+    if not _memory_enabled_for_actor(actor_user_id):
         return
 
     normalized_location = _clean_value(location)
@@ -959,10 +1465,10 @@ def _update_user_memory_from_ticket_facts(
     if normalized_location in (None, "", []) and normalized_contact in (None, "", []):
         return
 
-    current = _serialize_user_memory(crud.get_user_memory(db, actor))
+    current = _serialize_user_memory(crud.get_user_memory(db, actor_user_id))
     crud.upsert_user_memory(
         db,
-        actor,
+        actor_user_id,
         default_location=normalized_location or current.get("default_location"),
         default_contact=normalized_contact or current.get("default_contact"),
         source_ticket_id=str(source_ticket_id or "") or current.get("source_ticket_id"),
@@ -1004,6 +1510,52 @@ def _build_memory_applied_payload(payload: dict, applied_flags: dict | None) -> 
         return None
     visible["source"] = "user_memory"
     return visible
+
+
+def _merge_memory_applied_payload(response: dict, applied: dict | None) -> dict:
+    """把本轮应用的记忆信息合并进响应，保留既有长期记忆字段。"""
+    if not isinstance(applied, dict) or not applied:
+        return response
+    merged_response = dict(response or {})
+    existing = merged_response.get("memory_applied")
+    if isinstance(existing, dict):
+        merged = dict(existing)
+        short_term_items = [
+            item
+            for item in list(merged.get("short_term") or [])
+            if isinstance(item, dict)
+        ]
+        short_term_items.append(dict(applied))
+        merged["short_term"] = short_term_items
+        merged_response["memory_applied"] = merged
+    else:
+        merged_response["memory_applied"] = dict(applied)
+    return merged_response
+
+
+def _short_term_memory_applied_payload(
+    *,
+    explicit_ticket_id: str | None,
+    resolved_ticket_id: str | None,
+    explicit_draft_id: str | None,
+    effective_draft_id: str | None,
+) -> dict | None:
+    """记录短期记忆是否参与了 ticket/draft 引用恢复，便于 UI 与演示展示。"""
+    ticket_id = str(resolved_ticket_id or "").strip()
+    draft_id = str(effective_draft_id or "").strip()
+    if ticket_id and not str(explicit_ticket_id or "").strip():
+        return {
+            "source": "short_term_memory",
+            "type": "ticket_reference",
+            "ticket_id": ticket_id,
+        }
+    if draft_id and not str(explicit_draft_id or "").strip():
+        return {
+            "source": "short_term_memory",
+            "type": "draft_reference",
+            "draft_id": draft_id,
+        }
+    return None
 
 
 def _append_memory_applied_notice(message: str, memory_applied: dict | None) -> str:
@@ -1053,6 +1605,7 @@ def update_ticket_status_workflow(
     ticket_id: str,
     status: str,
     actor: str | None = None,
+    actor_user_id: str | None = None,
     audit_source: str | None = None,
 ) -> dict:
     """更新工单状态，并记录审计日志。"""
@@ -1061,10 +1614,13 @@ def update_ticket_status_workflow(
         raise LookupError(f"ticket_not_found:{ticket_id}")
 
     updated = crud.update_ticket_status(db, ticket, status)
+    normalized_actor = actor or "anonymous"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, normalized_actor)
     crud.create_audit_log(
         db,
         {
-            "actor": actor or "anonymous",
+            "actor": normalized_actor,
+            "actor_user_id": resolved_actor_user_id,
             "action_type": "UPDATE_TICKET",
             "target_type": "TICKET",
             "target_id": updated.public_id,
@@ -1080,6 +1636,7 @@ def add_ticket_comment_workflow(
     ticket_id: str,
     comment: str,
     actor: str | None = None,
+    actor_user_id: str | None = None,
     audit_source: str | None = None,
 ) -> dict:
     """向工单追加说明，改为 append-only 写入独立评论表。"""
@@ -1088,11 +1645,12 @@ def add_ticket_comment_workflow(
         raise LookupError(f"ticket_not_found:{ticket_id}")
 
     normalized_actor = actor or "anonymous"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, normalized_actor)
     normalized_comment = (comment or "").strip() or "用户未提供补充内容。"
     audit_request_id = _new_request_id()
     comment_record = models.TicketComment(
         ticket_id=ticket.id,
-        actor_user_id=normalized_actor,
+        actor_user_id=resolved_actor_user_id,
         content=normalized_comment,
     )
 
@@ -1103,6 +1661,7 @@ def add_ticket_comment_workflow(
     _append_audit_log_uncommitted(
         db,
         actor=normalized_actor,
+        actor_user_id=resolved_actor_user_id,
         action_type="ADD_TICKET_COMMENT",
         target_type="TICKET",
         target_id=ticket.public_id,
@@ -1124,6 +1683,7 @@ def escalate_ticket_workflow(
     db: Session,
     ticket_id: str,
     actor: str | None = None,
+    actor_user_id: str | None = None,
     reason: str | None = None,
     audit_source: str | None = None,
 ) -> dict:
@@ -1133,6 +1693,7 @@ def escalate_ticket_workflow(
         raise LookupError(f"ticket_not_found:{ticket_id}")
 
     normalized_actor = actor or "anonymous"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, normalized_actor)
     normalized_reason = (reason or "").strip() or "用户请求催办。"
     audit_request_id = _new_request_id()
     context = dict(ticket.context_json or {})
@@ -1148,6 +1709,7 @@ def escalate_ticket_workflow(
     _append_audit_log_uncommitted(
         db,
         actor=normalized_actor,
+        actor_user_id=resolved_actor_user_id,
         action_type="ESCALATE_TICKET",
         target_type="TICKET",
         target_id=ticket.public_id,
@@ -1170,6 +1732,7 @@ def cancel_ticket_workflow(
     db: Session,
     ticket_id: str,
     actor: str | None = None,
+    actor_user_id: str | None = None,
     reason: str | None = None,
     audit_source: str | None = None,
 ) -> dict:
@@ -1179,6 +1742,7 @@ def cancel_ticket_workflow(
         raise LookupError(f"ticket_not_found:{ticket_id}")
 
     normalized_actor = actor or "anonymous"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, normalized_actor)
     normalized_reason = (reason or "").strip() or "用户未提供取消原因。"
     audit_request_id = _new_request_id()
     context = dict(ticket.context_json or {})
@@ -1191,6 +1755,7 @@ def cancel_ticket_workflow(
     _append_audit_log_uncommitted(
         db,
         actor=normalized_actor,
+        actor_user_id=resolved_actor_user_id,
         action_type="CANCEL_TICKET",
         target_type="TICKET",
         target_id=ticket.public_id,
@@ -1234,18 +1799,20 @@ def _build_need_more_info_response(
 def _create_draft_for_missing_info(
     db: Session,
     actor: str,
+    actor_user_id: str | None,
     actor_department: str,
     chain_request_id: str,
     payload: dict,
     missing_fields: list[str],
 ) -> dict:
     """创建新草稿并写入草稿审计。"""
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     draft = crud.create_ticket_draft(
         db,
         {
             "draft_id": _new_draft_public_id(),
             "creator": actor,
-            "owner_user_id": actor,
+            "owner_user_id": resolved_actor_user_id,
             "department": actor_department,
             "payload_json": payload,
             "missing_fields_json": list(missing_fields),
@@ -1259,6 +1826,7 @@ def _create_draft_for_missing_info(
         db,
         {
             "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
             "action_type": "DRAFT_CREATED",
             "target_type": "TICKET_DRAFT",
             "target_id": draft.draft_id,
@@ -1303,9 +1871,12 @@ def _resume_ticket_draft_workflow(
     text: str,
     fields: dict | None,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
     actor_department: str,
 ) -> dict:
     """续办一个已存在的工单草稿，并保证“建单 + 消费草稿”只发生一次。"""
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     lock_stmt = (
         select(models.TicketDraft)
         .where(models.TicketDraft.draft_id == draft_id)
@@ -1317,6 +1888,7 @@ def _resume_ticket_draft_workflow(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "DRAFT_NOT_FOUND",
                 "target_type": "TICKET_DRAFT",
                 "target_id": draft_id,
@@ -1327,11 +1899,18 @@ def _resume_ticket_draft_workflow(
         raise LookupError("draft_not_found")
 
     chain_request_id = str(draft.kb_request_id or _new_request_id())
-    if str(draft.owner_user_id or draft.creator or "anonymous") != actor:
+    draft_owner_user_id = str(draft.owner_user_id or "").strip()
+    can_manage_draft = (
+        _is_admin_like(actor_role, actor)
+        or draft_owner_user_id == resolved_actor_user_id
+        or str(draft.creator or "anonymous") == actor
+    )
+    if not can_manage_draft:
         crud.create_audit_log(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "DRAFT_FORBIDDEN",
                 "target_type": "TICKET_DRAFT",
                 "target_id": draft.draft_id,
@@ -1351,6 +1930,7 @@ def _resume_ticket_draft_workflow(
                 db,
                 {
                     "actor": actor,
+                    "actor_user_id": resolved_actor_user_id,
                     "action_type": "DRAFT_ALREADY_CONSUMED",
                     "target_type": "TICKET_DRAFT",
                     "target_id": draft.draft_id,
@@ -1364,6 +1944,7 @@ def _resume_ticket_draft_workflow(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "DRAFT_ALREADY_CONSUMED",
                 "target_type": "TICKET_DRAFT",
                 "target_id": draft.draft_id,
@@ -1375,6 +1956,7 @@ def _resume_ticket_draft_workflow(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "AGENT_ROUTE",
                 "target_type": "TICKET",
                 "target_id": existing_ticket.public_id,
@@ -1402,6 +1984,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="DRAFT_EXPIRED",
             target_type="TICKET_DRAFT",
             target_id=draft.draft_id,
@@ -1411,6 +1994,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="AGENT_ROUTE",
             target_type="TICKET_DRAFT",
             target_id=draft.draft_id,
@@ -1454,6 +2038,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="DRAFT_UPDATED",
             target_type="TICKET_DRAFT",
             target_id=draft.draft_id,
@@ -1468,6 +2053,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="AGENT_ROUTE",
             target_type="TICKET_DRAFT",
             target_id=draft.draft_id,
@@ -1492,6 +2078,7 @@ def _resume_ticket_draft_workflow(
         ticket = models.Ticket(
             public_id=_new_ticket_public_id(),
             creator=str(merged_payload.get("creator") or actor),
+            creator_user_id=resolved_actor_user_id,
             department=str(merged_payload.get("department") or actor_department),
             category=str(merged_payload.get("category") or "other"),
             priority=str(merged_payload.get("priority") or "P2"),
@@ -1518,6 +2105,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="CREATE_TICKET",
             target_type="TICKET",
             target_id=ticket.public_id,
@@ -1534,6 +2122,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="DRAFT_CONSUMED",
             target_type="TICKET_DRAFT",
             target_id=draft.draft_id,
@@ -1546,6 +2135,7 @@ def _resume_ticket_draft_workflow(
         _append_audit_log_uncommitted(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="AGENT_ROUTE",
             target_type="TICKET",
             target_id=ticket.public_id,
@@ -1562,7 +2152,8 @@ def _resume_ticket_draft_workflow(
         db.refresh(draft)
         _update_user_memory_from_ticket_facts(
             db,
-            actor,
+            actor=actor,
+            actor_user_id=resolved_actor_user_id,
             location=merged_payload.get("location"),
             contact=merged_payload.get("contact"),
             source_ticket_id=ticket.public_id,
@@ -1585,6 +2176,7 @@ def _resume_ticket_draft_workflow(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "DRAFT_ALREADY_CONSUMED",
                 "target_type": "TICKET_DRAFT",
                 "target_id": recovered_draft.draft_id,
@@ -1596,6 +2188,7 @@ def _resume_ticket_draft_workflow(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "AGENT_ROUTE",
                 "target_type": "TICKET",
                 "target_id": existing_ticket.public_id,
@@ -1611,7 +2204,8 @@ def _resume_ticket_draft_workflow(
         recovered_payload = dict(recovered_draft.payload_json or {})
         _update_user_memory_from_ticket_facts(
             db,
-            actor,
+            actor=actor,
+            actor_user_id=resolved_actor_user_id,
             location=recovered_payload.get("location"),
             contact=recovered_payload.get("contact"),
             source_ticket_id=existing_ticket.public_id,
@@ -1628,14 +2222,23 @@ def _handle_kb_intent(
     db: Session,
     text: str,
     actor: str,
+    actor_user_id: str | None,
     actor_department: str,
 ) -> dict:
     """按既有 ASK 路径处理纯知识问答。"""
-    kb_result = run_ask_workflow(db, text, actor, actor_department)
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
+    kb_result = run_ask_workflow(
+        db,
+        text,
+        actor,
+        actor_department,
+        actor_user_id=resolved_actor_user_id,
+    )
     crud.create_audit_log(
         db,
         {
             "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
             "action_type": "AGENT_ROUTE",
             "target_type": "KB_QUERY",
             "target_id": kb_result["query_id"],
@@ -1650,15 +2253,23 @@ def _handle_create_ticket_intent(
     db: Session,
     text: str,
     actor: str,
+    actor_user_id: str | None,
     actor_department: str,
     planner_fields: dict | None = None,
 ) -> dict:
     """按既有建单链路处理：先问答，再抽取，再建单或进入草稿。"""
-    kb_result = run_ask_workflow(db, text, actor, actor_department)
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
+    kb_result = run_ask_workflow(
+        db,
+        text,
+        actor,
+        actor_department,
+        actor_user_id=resolved_actor_user_id,
+    )
     extracted = extract_ticket_payload(text, actor, actor_department)
     if isinstance(planner_fields, dict):
         extracted = _merge_draft_payload(extracted, planner_fields)
-    user_memory_snapshot = _load_user_memory(db, actor)
+    user_memory_snapshot = _load_user_memory(db, resolved_actor_user_id)
 
     payload = _build_ticket_payload(
         extracted,
@@ -1676,6 +2287,7 @@ def _handle_create_ticket_intent(
         draft_response = _create_draft_for_missing_info(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             actor_department=actor_department,
             chain_request_id=chain_request_id,
             payload=payload,
@@ -1692,6 +2304,7 @@ def _handle_create_ticket_intent(
             db,
             {
                 "actor": actor,
+                "actor_user_id": resolved_actor_user_id,
                 "action_type": "AGENT_ROUTE",
                 "target_type": "TICKET_DRAFT",
                 "target_id": str(draft_info.get("draft_id") or ""),
@@ -1725,12 +2338,14 @@ def _handle_create_ticket_intent(
         },
         request_id=chain_request_id,
         audit_action="CREATE_TICKET",
+        actor_user_id=resolved_actor_user_id,
     )
 
     crud.create_audit_log(
         db,
         {
             "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
             "action_type": "AGENT_ROUTE",
             "target_type": "TICKET",
             "target_id": ticket["ticket_id"],
@@ -1760,6 +2375,8 @@ def _run_agent_workflow_rules(
     db: Session,
     text: str,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
     actor_department: str,
     draft_id: str | None = None,
     resolved_ticket_id: str | None = None,
@@ -1774,6 +2391,8 @@ def _run_agent_workflow_rules(
             text=text,
             fields=fields,
             actor=actor,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
             actor_department=actor_department,
         )
 
@@ -1782,18 +2401,41 @@ def _run_agent_workflow_rules(
             db,
             confirm_token=str(confirm_token),
             actor=actor,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
             text=text,
         )
 
     ticket_id = str(resolved_ticket_id or "") or _extract_ticket_public_id(text)
     if ticket_id:
         action = _route_ticket_tool_action_by_rules(text)
-        return _handle_ticket_tool_route_rules(db, action, ticket_id, text, actor)
+        return _handle_ticket_tool_route_rules(
+            db,
+            action,
+            ticket_id,
+            text,
+            actor,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+        )
 
     if not _should_route_to_ticket(text):
-        return _handle_kb_intent(db, text, actor, actor_department)
+        return _handle_kb_intent(
+            db,
+            text,
+            actor,
+            actor_user_id=actor_user_id,
+            actor_department=actor_department,
+        )
 
-    return _handle_create_ticket_intent(db, text, actor, actor_department, planner_fields=None)
+    return _handle_create_ticket_intent(
+        db,
+        text,
+        actor,
+        actor_user_id=actor_user_id,
+        actor_department=actor_department,
+        planner_fields=None,
+    )
 
 
 def _global_plan_target(
@@ -1816,6 +2458,7 @@ def _validate_global_plan(
     db: Session,
     plan: ToolPlan,
     actor: str,
+    actor_user_id: str | None,
     request_id: str,
     normalized_text: str,
     provided_ticket_id: str,
@@ -1837,6 +2480,7 @@ def _validate_global_plan(
         _audit_global_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_REJECTED",
             target_type=target_type,
             target_id=target_id,
@@ -1860,6 +2504,7 @@ def _validate_global_plan(
             _audit_global_plan_event(
                 db,
                 actor=actor,
+                actor_user_id=actor_user_id,
                 action_type="PLAN_REJECTED",
                 target_type=target_type,
                 target_id=target_id,
@@ -1917,6 +2562,8 @@ def _handle_global_planner_route(
     db: Session,
     text: str,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
     actor_department: str,
     mode: str,
     draft_id: str | None = None,
@@ -1926,11 +2573,14 @@ def _handle_global_planner_route(
     confirm_token: str | None = None,
 ) -> dict:
     """执行 Global Planner；仅做分支选择，ticket 细粒度再交给子规划器。"""
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     if confirm_token:
         return _handle_confirmed_pending_action(
             db,
             confirm_token=str(confirm_token),
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
+            actor_role=actor_role,
             text=text,
         )
 
@@ -1940,7 +2590,7 @@ def _handle_global_planner_route(
     provided_draft_id = str(draft_id or "").strip()
     request_id = _new_request_id()
     planner_context = {
-        "actor_user_id": actor,
+        "actor_user_id": resolved_actor_user_id,
         "provided_ticket_id": provided_ticket_id,
         "provided_draft_id": provided_draft_id,
         "has_ticket_id": bool(provided_ticket_id),
@@ -1968,6 +2618,7 @@ def _handle_global_planner_route(
         _audit_global_plan_event(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="PLAN_REJECTED",
             target_type="AGENT",
             target_id=request_id,
@@ -1983,6 +2634,8 @@ def _handle_global_planner_route(
                 db,
                 text=text,
                 actor=actor,
+                actor_user_id=resolved_actor_user_id,
+                actor_role=actor_role,
                 actor_department=actor_department,
                 draft_id=draft_id,
                 resolved_ticket_id=provided_ticket_id,
@@ -1995,6 +2648,7 @@ def _handle_global_planner_route(
     _audit_global_plan_event(
         db,
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
         action_type="PLAN_PROPOSED",
         target_type=target_type,
         target_id=target_id,
@@ -2013,6 +2667,7 @@ def _handle_global_planner_route(
         db,
         plan=plan,
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
         request_id=request_id,
         normalized_text=text,
         provided_ticket_id=provided_ticket_id,
@@ -2025,6 +2680,7 @@ def _handle_global_planner_route(
         _audit_global_plan_event(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="PLAN_REJECTED",
             target_type=str(validation_result.get("target_type") or target_type),
             target_id=str(validation_result.get("target_id") or target_id),
@@ -2040,6 +2696,8 @@ def _handle_global_planner_route(
                 db,
                 text=text,
                 actor=actor,
+                actor_user_id=resolved_actor_user_id,
+                actor_role=actor_role,
                 actor_department=actor_department,
                 draft_id=draft_id,
                 resolved_ticket_id=provided_ticket_id,
@@ -2052,6 +2710,7 @@ def _handle_global_planner_route(
     _audit_global_plan_event(
         db,
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
         action_type="PLAN_EXECUTED",
         target_type=str(validation_result.get("target_type") or target_type),
         target_id=str(validation_result.get("target_id") or target_id),
@@ -2070,6 +2729,8 @@ def _handle_global_planner_route(
             text=text,
             fields=validated_args.get("fields"),
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
+            actor_role=actor_role,
             actor_department=actor_department,
         )
     if plan.tool == "ticket_tool_planner":
@@ -2078,6 +2739,8 @@ def _handle_global_planner_route(
             ticket_id=str(validated_args.get("ticket_id") or ""),
             text=str(validated_args.get("raw_text") or text),
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
+            actor_role=actor_role,
             mode=mode,
         )
     if plan.tool == "kb_answer":
@@ -2085,12 +2748,14 @@ def _handle_global_planner_route(
             db,
             text=str(validated_args.get("query") or text),
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             actor_department=actor_department,
         )
     return _handle_create_ticket_intent(
         db,
         text=str(validated_args.get("text") or text),
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
         actor_department=actor_department,
         planner_fields=validated_args.get("fields"),
     )
@@ -2147,14 +2812,24 @@ def _dump_pydantic_model(model_instance) -> dict:
     return model_instance.dict(exclude_none=True)
 
 
-def _actor_satisfies_auth_rule(actor: str, auth_rule: str, ticket) -> bool:
+def _actor_satisfies_auth_rule(
+    actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
+    auth_rule: str,
+    ticket,
+) -> bool:
     """根据技能声明的 auth_rule 做最小权限校验。"""
     normalized_actor = (actor or "").strip()
+    normalized_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     if auth_rule == "owner_or_admin":
-        if normalized_actor in _ADMIN_ACTORS:
+        if _is_admin_like(actor_role, normalized_actor):
+            return True
+        ticket_creator_user_id = str(ticket.creator_user_id or "").strip()
+        if ticket_creator_user_id and normalized_actor_user_id == ticket_creator_user_id:
             return True
         return normalized_actor == str(ticket.creator or "")
-    return bool(normalized_actor)
+    return bool(normalized_actor_user_id and normalized_actor_user_id != "anonymous")
 
 
 def _build_ticket_tool_dispatch_args(skill, ticket_id: str, stripped_text: str) -> dict:
@@ -2170,6 +2845,7 @@ def _execute_ticket_tool_skill(
     skill,
     dispatch_args: dict,
     actor: str,
+    actor_user_id: str | None,
     text: str,
     request_id: str,
     planner_mode: str,
@@ -2189,6 +2865,7 @@ def _execute_ticket_tool_skill(
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_EXECUTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2203,6 +2880,7 @@ def _execute_ticket_tool_skill(
         db,
         {
             "actor": actor,
+            "actor_user_id": _resolve_actor_user_id(actor_user_id, actor),
             "action_type": "AGENT_ROUTE",
             "target_type": "TICKET",
             "target_id": ticket_id,
@@ -2230,6 +2908,8 @@ def _handle_ticket_tool_route_rules(
     ticket_id: str,
     text: str,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
 ) -> dict:
     """执行既有的规则路由路径；作为 `rules` 与 `hybrid` 的回退底线。"""
     registry = get_ticket_tool_registry()
@@ -2239,13 +2919,39 @@ def _handle_ticket_tool_route_rules(
 
     stripped_text = _strip_ticket_reference(text, ticket_id)
     dispatch_args = _build_ticket_tool_dispatch_args(skill, ticket_id, stripped_text)
+    request_id = _new_request_id()
+    plan = _validate_pydantic_model(
+        ToolPlan,
+        {
+            "tool": skill.name,
+            "args": dispatch_args,
+            "need_confirmation": skill.risk_level == "HIGH",
+            "missing_fields": [],
+        },
+    )
+    validation_result = _validate_ticket_tool_plan(
+        db,
+        plan=plan,
+        actor=actor,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
+        request_id=request_id,
+        confirmation_verified=False,
+    )
+    status = str(validation_result.get("status") or "")
+    if status == "response":
+        return validation_result["response"]
+    if status != "validated":
+        return _build_plan_rejected_response("规则路由校验失败，当前未执行任何工单操作。")
+
     return _execute_ticket_tool_skill(
         db=db,
-        skill=skill,
-        dispatch_args=dispatch_args,
+        skill=validation_result["skill"],
+        dispatch_args=validation_result["args"],
         actor=actor,
+        actor_user_id=actor_user_id,
         text=text,
-        request_id=_new_request_id(),
+        request_id=request_id,
         planner_mode="rules",
         planned=None,
     )
@@ -2254,14 +2960,16 @@ def _handle_ticket_tool_route_rules(
 def _issue_pending_confirmation(
     db: Session,
     actor: str,
+    actor_user_id: str | None,
     tool_name: str,
     ticket_id: str,
     request_id: str,
     args: dict,
 ) -> dict:
     """为高风险动作创建待确认记录，并返回 `NEED_CONFIRMATION`。"""
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     pending_action = models.PendingAction(
-        user_id=actor,
+        user_id=resolved_actor_user_id,
         tool_name=tool_name,
         args_json=dict(args or {}),
         status="pending",
@@ -2272,6 +2980,7 @@ def _issue_pending_confirmation(
     _append_audit_log_uncommitted(
         db,
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
         action_type="NEED_CONFIRMATION",
         target_type="TICKET",
         target_id=ticket_id,
@@ -2295,6 +3004,8 @@ def _validate_ticket_tool_plan(
     db: Session,
     plan: ToolPlan,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
     request_id: str,
     *,
     confirmation_verified: bool = False,
@@ -2315,6 +3026,7 @@ def _validate_ticket_tool_plan(
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2345,6 +3057,7 @@ def _validate_ticket_tool_plan(
             _audit_plan_event(
                 db,
                 actor=actor,
+                actor_user_id=actor_user_id,
                 action_type="PLAN_REJECTED",
                 ticket_id=ticket_id,
                 request_id=request_id,
@@ -2370,6 +3083,7 @@ def _validate_ticket_tool_plan(
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2383,10 +3097,17 @@ def _validate_ticket_tool_plan(
             "response": _build_plan_rejected_response("目标工单不存在，当前未执行操作。"),
         }
 
-    if not _actor_satisfies_auth_rule(actor, skill.auth_rule, ticket):
+    if not _actor_satisfies_auth_rule(
+        actor,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
+        auth_rule=skill.auth_rule,
+        ticket=ticket,
+    ):
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2405,6 +3126,7 @@ def _validate_ticket_tool_plan(
         response = _issue_pending_confirmation(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             tool_name=skill.name,
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2426,9 +3148,12 @@ def _handle_confirmed_pending_action(
     db: Session,
     confirm_token: str,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
     text: str,
 ) -> dict:
     """消费一个确认 token，并执行对应的高风险动作。"""
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     normalized_token = str(confirm_token or "").strip()
     if not normalized_token:
         return _build_plan_rejected_response("confirm_token 不能为空。")
@@ -2439,10 +3164,11 @@ def _handle_confirmed_pending_action(
 
     request_id = _new_request_id()
     ticket_id = str((pending_action.args_json or {}).get("ticket_id") or "")
-    if str(pending_action.user_id or "") != actor:
+    if str(pending_action.user_id or "") != resolved_actor_user_id:
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2463,6 +3189,7 @@ def _handle_confirmed_pending_action(
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2487,6 +3214,8 @@ def _handle_confirmed_pending_action(
         db,
         plan=plan,
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
+        actor_role=actor_role,
         request_id=request_id,
         confirmation_verified=True,
     )
@@ -2498,6 +3227,7 @@ def _handle_confirmed_pending_action(
         skill=validation_result["skill"],
         dispatch_args=validation_result["args"],
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
         text=text,
         request_id=request_id,
         planner_mode="llm_confirmed",
@@ -2514,6 +3244,8 @@ def _handle_ticket_tool_route_with_planner(
     ticket_id: str,
     text: str,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
     mode: str,
 ) -> dict:
     """走 LLM Planner -> Validator -> Dispatch；必要时可回退旧规则。"""
@@ -2530,6 +3262,7 @@ def _handle_ticket_tool_route_with_planner(
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2540,12 +3273,21 @@ def _handle_ticket_tool_route_with_planner(
         )
         if mode == "hybrid" and exc.fallback_eligible:
             fallback_action = _route_ticket_tool_action_by_rules(text)
-            return _handle_ticket_tool_route_rules(db, fallback_action, ticket_id, text, actor)
+            return _handle_ticket_tool_route_rules(
+                db,
+                fallback_action,
+                ticket_id,
+                text,
+                actor,
+                actor_user_id=actor_user_id,
+                actor_role=actor_role,
+            )
         return _build_plan_rejected_response("智能规划失败，当前未执行任何工单操作。")
 
     _audit_plan_event(
         db,
         actor=actor,
+        actor_user_id=actor_user_id,
         action_type="PLAN_PROPOSED",
         ticket_id=ticket_id,
         request_id=request_id,
@@ -2562,6 +3304,8 @@ def _handle_ticket_tool_route_with_planner(
         db,
         plan=plan,
         actor=actor,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
         request_id=request_id,
         confirmation_verified=False,
     )
@@ -2572,6 +3316,7 @@ def _handle_ticket_tool_route_with_planner(
             skill=validation_result["skill"],
             dispatch_args=validation_result["args"],
             actor=actor,
+            actor_user_id=actor_user_id,
             text=text,
             request_id=request_id,
             planner_mode=mode,
@@ -2583,6 +3328,7 @@ def _handle_ticket_tool_route_with_planner(
         _audit_plan_event(
             db,
             actor=actor,
+            actor_user_id=actor_user_id,
             action_type="PLAN_REJECTED",
             ticket_id=ticket_id,
             request_id=request_id,
@@ -2593,7 +3339,15 @@ def _handle_ticket_tool_route_with_planner(
         )
     if status == "fallback" and mode == "hybrid":
         fallback_action = _route_ticket_tool_action_by_rules(text)
-        return _handle_ticket_tool_route_rules(db, fallback_action, ticket_id, text, actor)
+        return _handle_ticket_tool_route_rules(
+            db,
+            fallback_action,
+            ticket_id,
+            text,
+            actor,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+        )
     return _build_plan_rejected_response("规划结果未通过校验，当前未执行任何工单操作。")
 
 
@@ -2602,13 +3356,31 @@ def _handle_ticket_tool_route(
     ticket_id: str,
     text: str,
     actor: str,
+    actor_user_id: str | None,
+    actor_role: str | None,
 ) -> dict:
     """按 Feature Flag 选择规则路由或 LLM Planner 路径。"""
     mode = _agent_planner_mode()
     if mode == "rules":
         action = _route_ticket_tool_action_by_rules(text)
-        return _handle_ticket_tool_route_rules(db, action, ticket_id, text, actor)
-    return _handle_ticket_tool_route_with_planner(db, ticket_id, text, actor, mode)
+        return _handle_ticket_tool_route_rules(
+            db,
+            action,
+            ticket_id,
+            text,
+            actor,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+        )
+    return _handle_ticket_tool_route_with_planner(
+        db,
+        ticket_id,
+        text,
+        actor,
+        actor_user_id=actor_user_id,
+        actor_role=actor_role,
+        mode=mode,
+    )
 
 
 def run_agent_workflow(
@@ -2619,12 +3391,16 @@ def run_agent_workflow(
     draft_id: str | None = None,
     fields: dict | None = None,
     confirm_token: str | None = None,
+    actor_user_id: str | None = None,
+    actor_role: str | None = None,
 ) -> dict:
     """执行 Agent 主工作流：规则模式或 Global Planner 模式。"""
     actor = user or "anonymous"
+    resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     actor_department = department or "general"
-    normalized_text = (text or "").strip()
-    memory_snapshot = _load_short_term_memory(db, actor)
+    """只去除两端空白格符"""
+    normalized_text = (text or "").strip() #
+    memory_snapshot = _load_short_term_memory(db, resolved_actor_user_id)
     explicit_ticket_id = _extract_ticket_public_id(normalized_text)
     effective_draft_id = str(draft_id or "").strip() or _infer_draft_id_from_memory(
         normalized_text,
@@ -2639,6 +3415,12 @@ def run_agent_workflow(
         )
         or ""
     )
+    short_term_memory_applied = _short_term_memory_applied_payload(
+        explicit_ticket_id=explicit_ticket_id,
+        resolved_ticket_id=resolved_ticket_id or None,
+        explicit_draft_id=draft_id,
+        effective_draft_id=effective_draft_id or None,
+    )
     if _needs_ticket_reference_clarification(
         normalized_text,
         resolved_ticket_id=resolved_ticket_id or None,
@@ -2651,15 +3433,18 @@ def run_agent_workflow(
             db,
             text=normalized_text,
             actor=actor,
+            actor_user_id=resolved_actor_user_id,
+            actor_role=actor_role,
             actor_department=actor_department,
             draft_id=effective_draft_id or None,
             resolved_ticket_id=resolved_ticket_id or None,
             fields=fields,
             confirm_token=confirm_token,
         )
+        response = _merge_memory_applied_payload(response, short_term_memory_applied)
         _update_short_term_memory_from_response(
             db,
-            actor=actor,
+            actor_user_id=resolved_actor_user_id,
             text=normalized_text,
             response=response,
         )
@@ -2668,6 +3453,8 @@ def run_agent_workflow(
         db,
         text=normalized_text,
         actor=actor,
+        actor_user_id=resolved_actor_user_id,
+        actor_role=actor_role,
         actor_department=actor_department,
         mode=mode,
         draft_id=effective_draft_id or None,
@@ -2676,9 +3463,10 @@ def run_agent_workflow(
         fields=fields,
         confirm_token=confirm_token,
     )
+    response = _merge_memory_applied_payload(response, short_term_memory_applied)
     _update_short_term_memory_from_response(
         db,
-        actor=actor,
+        actor_user_id=resolved_actor_user_id,
         text=normalized_text,
         response=response,
     )

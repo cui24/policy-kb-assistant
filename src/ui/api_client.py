@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from dotenv import load_dotenv
@@ -94,7 +95,7 @@ def _parse_response_body(response: httpx.Response) -> Any:
 def _default_error_message(status_code: int) -> str:
     """根据状态码生成更适合 UI 展示的错误说明。"""
     if status_code == 401:
-        return "API 鉴权失败（401）。请检查 API Key。"
+        return "API 鉴权失败（401）。请先登录并检查 Bearer Token。"
     if status_code == 403:
         return "当前请求被拒绝（403）。你没有权限执行该操作。"
     if status_code == 404:
@@ -114,21 +115,32 @@ class PolicyAPIClient:
         base_url: str | None = None,
         timeout_seconds: float = 45.0,
         api_key: str | None = None,
+        access_token: str | None = None,
     ) -> None:
         load_dotenv()
         env_base_url = os.getenv("POLICY_API_BASE_URL", "http://localhost:8080")
         env_api_key = str(os.getenv("POLICY_API_KEY") or "").strip()
+        env_access_token = str(os.getenv("POLICY_API_ACCESS_TOKEN") or "").strip()
         self.base_url = _normalize_base_url(base_url or env_base_url)
         self.timeout_seconds = float(timeout_seconds)
         normalized_api_key = None if api_key is None else api_key.strip()
         self.api_key = normalized_api_key if normalized_api_key else env_api_key
+        normalized_access_token = None if access_token is None else access_token.strip()
+        self.access_token = normalized_access_token if normalized_access_token else env_access_token
+
+    def set_access_token(self, access_token: str | None) -> None:
+        """设置或清空 Bearer token。"""
+        normalized = None if access_token is None else access_token.strip()
+        self.access_token = normalized or ""
 
     def _build_headers(self) -> dict[str, str]:
-        """构造请求头；若配置了 API Key，则自动附加。"""
+        """构造请求头；优先附加 Bearer token，兼容附加 API Key。"""
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
         if self.api_key:
             headers["X-API-Key"] = self.api_key
         return headers
@@ -139,15 +151,23 @@ class PolicyAPIClient:
         path: str,
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> Any:
         """统一发请求、解析结果并转换错误。"""
         url = f"{self.base_url}{path}"
+        headers = self._build_headers()
+        if isinstance(extra_headers, dict):
+            for key, value in extra_headers.items():
+                normalized_key = str(key or "").strip()
+                normalized_value = str(value or "").strip()
+                if normalized_key and normalized_value:
+                    headers[normalized_key] = normalized_value
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
                 response = client.request(
                     method=method.upper(),
                     url=url,
-                    headers=self._build_headers(),
+                    headers=headers,
                     json=json_body,
                     params=params,
                 )
@@ -170,6 +190,43 @@ class PolicyAPIClient:
     def health(self) -> dict[str, Any]:
         """调用 `/health`。"""
         data = self._request("GET", "/health")
+        return data if isinstance(data, dict) else {"raw": data}
+
+    def register(
+        self,
+        username: str,
+        password: str,
+        email: str | None = None,
+        phone: str | None = None,
+    ) -> dict[str, Any]:
+        """调用 `POST /auth/register`。"""
+        data = self._request(
+            "POST",
+            "/auth/register",
+            json_body={
+                "username": username,
+                "password": password,
+                "email": email,
+                "phone": phone,
+            },
+        )
+        return data if isinstance(data, dict) else {"raw": data}
+
+    def login(self, identifier: str, password: str) -> dict[str, Any]:
+        """调用 `POST /auth/login`。"""
+        data = self._request(
+            "POST",
+            "/auth/login",
+            json_body={
+                "identifier": identifier,
+                "password": password,
+            },
+        )
+        return data if isinstance(data, dict) else {"raw": data}
+
+    def me(self) -> dict[str, Any]:
+        """调用 `GET /auth/me`。"""
+        data = self._request("GET", "/auth/me")
         return data if isinstance(data, dict) else {"raw": data}
 
     def ask(
@@ -222,8 +279,10 @@ class PolicyAPIClient:
         priority: str = "P2",
         contact: str | None = None,
         context: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """调用 `POST /tickets`。"""
+        normalized_idempotency_key = str(idempotency_key or "").strip() or f"ticket-create-{uuid4().hex}"
         data = self._request(
             "POST",
             "/tickets",
@@ -237,6 +296,7 @@ class PolicyAPIClient:
                 "contact": contact,
                 "context": context or {},
             },
+            extra_headers={"Idempotency-Key": normalized_idempotency_key},
         )
         return data if isinstance(data, dict) else {"raw": data}
 

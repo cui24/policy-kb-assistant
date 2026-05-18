@@ -1,5 +1,29 @@
-# Default aggregate requirements for the full local dev/runtime stack.
-# Includes API/MCP/runtime deps plus Streamlit/test tooling.
-# For narrower installs, use the layered files under requirements/ directly.
--r requirements/l3.txt
--r requirements/l1.txt
+fastapi==0.135.2
+uvicorn[standard]==0.42.0
+
+sqlalchemy
+psycopg2-binary
+redis
+alembic
+orjson
+
+python-dotenv
+pydantic==2.12.5
+PyJWT
+PyYAML
+httpx
+
+openai
+langchain-core==1.2.16
+langchain-openai==1.1.10
+langchain-text-splitters==1.1.1
+langgraph
+
+qdrant-client
+sentence-transformers
+pypdf
+tqdm
+rich
+rank-bm25
+numpy
+scikit-learn

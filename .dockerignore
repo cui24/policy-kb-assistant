@@ -1,0 +1,13 @@
+.git
+.github
+.cursor
+.specstory
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+tests
+study_test
+current-freeze.txt
+.env

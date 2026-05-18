@@ -15,6 +15,7 @@ L3/L4 服务层测试：覆盖 `services.py` 的核心工作流。
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -153,6 +154,202 @@ def test_run_ask_workflow_persists_query_and_audit(monkeypatch) -> None:
     finally:
         db.close()
 
+
+
+def test_run_ask_workflow_stream_emits_events_and_persists(monkeypatch) -> None:
+    """流式 ASK 应输出 token/final/done，并写入问答与审计记录。"""
+    db = _build_test_session()
+    try:
+        monkeypatch.setattr(
+            services,
+            "retrieve",
+            lambda question: [
+                {
+                    "doc_id": "henu_network_manual",
+                    "page": 8,
+                    "score": 0.93,
+                    "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                }
+            ],
+        )
+
+        def _fake_stream(question, evidence):
+            yield {"event": "token", "delta": "你"}
+            yield {"event": "token", "delta": "好"}
+            return {
+                "answer": "你好",
+                "citations": [
+                    {
+                        "doc_id": "henu_network_manual",
+                        "page": 8,
+                        "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                    }
+                ],
+                "meta": {
+                    "attempt_stage": "primary_stream",
+                    "json_ok": True,
+                    "repair_used": False,
+                    "failure_reason": None,
+                },
+            }
+
+        monkeypatch.setattr(services, "stream_answer_with_citations_official", _fake_stream)
+
+        events = list(
+            services.run_ask_workflow_stream(
+                db,
+                question="统一身份认证的登录地址是什么？",
+                user="alice",
+                department="IT",
+            )
+        )
+
+        assert events[0]["event"] == "status"
+        assert any(item["event"] == "token" for item in events)
+        final_event = next(item for item in events if item["event"] == "final")
+        done_event = next(item for item in events if item["event"] == "done")
+        assert final_event["data"]["answer"] == "你好"
+        assert done_event["data"]["ok"] is True
+
+        request_id = str(final_event["data"]["request_id"])
+        kb_records = crud.list_kb_queries(db, request_id=request_id, limit=10)
+        assert len(kb_records) == 1
+
+        audit_records = crud.list_audit_logs(db, request_id=request_id, limit=10)
+        assert len(audit_records) == 1
+        assert audit_records[0].action_type == "ASK"
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_async_persists_query_and_audit(monkeypatch) -> None:
+    """异步 ASK 工作流应写入问答记录和 ASK 审计日志。"""
+    db = _build_test_session()
+    try:
+        async def _fake_retrieve(question: str):
+            return [
+                {
+                    "doc_id": "henu_network_manual",
+                    "page": 5,
+                    "score": 0.88,
+                    "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                }
+            ]
+
+        async def _fake_answer(question: str, hits: list[dict]):
+            return {
+                "answer": "统一身份认证的登录地址是 https://ids.henu.edu.cn。",
+                "citations": [
+                    {
+                        "doc_id": "henu_network_manual",
+                        "page": 5,
+                        "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                    }
+                ],
+                "meta": {
+                    "attempt_stage": "primary_async",
+                    "json_ok": True,
+                    "repair_used": False,
+                    "failure_reason": None,
+                },
+            }
+
+        monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
+        monkeypatch.setattr(services, "answer_with_citations_async", _fake_answer)
+
+        result = asyncio.run(
+            services.run_ask_workflow_async(
+                db,
+                question="统一身份认证的登录地址是什么？",
+                user="alice",
+                department="IT",
+            )
+        )
+
+        assert result["request_id"].startswith("req_")
+        assert result["answer"].startswith("统一身份认证的登录地址")
+        assert result["meta"]["valid_json"] is True
+
+        kb_records = crud.list_kb_queries(db, request_id=result["request_id"], limit=10)
+        assert len(kb_records) == 1
+        assert kb_records[0].question == "统一身份认证的登录地址是什么？"
+
+        audit_records = crud.list_audit_logs(db, request_id=result["request_id"], limit=10)
+        assert len(audit_records) == 1
+        assert audit_records[0].action_type == "ASK"
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_stream_async_emits_events_and_persists(monkeypatch) -> None:
+    """异步流式 ASK 应输出 token/final/done，并写入问答与审计记录。"""
+    db = _build_test_session()
+    try:
+        async def _fake_retrieve(question: str):
+            return [
+                {
+                    "doc_id": "henu_network_manual",
+                    "page": 8,
+                    "score": 0.93,
+                    "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                }
+            ]
+
+        async def _fake_stream(question: str, evidence: list[dict]):
+            yield {"event": "token", "delta": "你"}
+            yield {"event": "token", "delta": "好"}
+            yield {
+                "event": "final_result",
+                "result": {
+                    "answer": "你好",
+                    "citations": [
+                        {
+                            "doc_id": "henu_network_manual",
+                            "page": 8,
+                            "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                        }
+                    ],
+                    "meta": {
+                        "attempt_stage": "primary_stream_async",
+                        "json_ok": True,
+                        "repair_used": False,
+                        "failure_reason": None,
+                    },
+                },
+            }
+
+        monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
+        monkeypatch.setattr(services, "stream_answer_with_citations_official_async", _fake_stream)
+
+        async def _collect() -> list[dict]:
+            items: list[dict] = []
+            async for item in services.run_ask_workflow_stream_async(
+                db,
+                question="统一身份认证的登录地址是什么？",
+                user="alice",
+                department="IT",
+            ):
+                items.append(item)
+            return items
+
+        events = asyncio.run(_collect())
+
+        assert events[0]["event"] == "status"
+        assert any(item["event"] == "token" for item in events)
+        final_event = next(item for item in events if item["event"] == "final")
+        done_event = next(item for item in events if item["event"] == "done")
+        assert final_event["data"]["answer"] == "你好"
+        assert done_event["data"]["ok"] is True
+
+        request_id = str(final_event["data"]["request_id"])
+        kb_records = crud.list_kb_queries(db, request_id=request_id, limit=10)
+        assert len(kb_records) == 1
+
+        audit_records = crud.list_audit_logs(db, request_id=request_id, limit=10)
+        assert len(audit_records) == 1
+        assert audit_records[0].action_type == "ASK"
+    finally:
+        db.close()
 
 
 def test_create_ticket_workflow_persists_ticket_and_audit() -> None:
@@ -452,6 +649,31 @@ def test_run_agent_workflow_prompts_for_ticket_id_when_reference_cannot_be_resol
         assert result["missing_fields"] == ["ticket_id"]
         assert "我没找到你提到的“上一单”" in str(result["message"])
         assert "TCK-2026-XXXXXX" in str(result["message"])
+    finally:
+        db.close()
+
+
+def test_run_agent_workflow_prompts_for_ticket_id_on_colloquial_follow_ups() -> None:
+    """口语化“上次报的/刚才那张”在无可恢复对象时也应追问 ticket_id。"""
+    db = _build_test_session()
+    try:
+        first = services.run_agent_workflow(
+            db,
+            text="我上次报的断网问题还没好吗？",
+            user="alice",
+            department="IT",
+        )
+        second = services.run_agent_workflow(
+            db,
+            text="把刚才那张撤掉吧，已经好了",
+            user="alice",
+            department="IT",
+        )
+
+        for result in (first, second):
+            assert result["route"] == "NEED_MORE_INFO"
+            assert result["missing_fields"] == ["ticket_id"]
+            assert "TCK-2026-XXXXXX" in str(result["message"])
     finally:
         db.close()
 

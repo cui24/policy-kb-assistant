@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from src.api.db import SessionLocal
 from src.api.deps import load_runtime_settings
 from src.api.migrations import ensure_schema_ready
-from src.api import services_mcp
+from src.mcp_wrapper import ToolCallRequest, invoke_tool
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,9 @@ def build_mcp_server(
     *,
     actor_user_id: str,
     department: str = "IT",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    streamable_http_path: str = "/mcp",
     session_factory: Callable[[], Session] = SessionLocal,
 ) -> FastMCP:
     """构造一个绑定固定 actor 的 FastMCP server。"""
@@ -55,71 +58,127 @@ def build_mcp_server(
             "Demo mode: single-user fixed actor. "
             f"actor_user_id={normalized_actor}; department={normalized_department}."
         ),
+        host=host,
+        port=port,
+        streamable_http_path=streamable_http_path,
     )
 
-    @app.tool()
-    def lookup_ticket(ticket_id: str) -> dict[str, Any]:
-        """按工单号查询工单详情与评论。"""
-        with _db_session(session_factory) as db:
-            return services_mcp.invoke_ticket_tool(
-                db,
-                tool_name="lookup_ticket",
-                args={"ticket_id": ticket_id},
+    def _invoke_tool(db: Session, tool: str, args: dict[str, Any], raw_text: str = "") -> dict[str, Any]:
+        result = invoke_tool(
+            db,
+            ToolCallRequest(
+                tool=tool,
+                args=dict(args or {}),
                 actor=normalized_actor,
-                raw_text=f"MCP lookup {ticket_id}",
+                actor_user_id=normalized_actor,
+                actor_role="user",
+                department=normalized_department,
+                raw_text=raw_text,
+            ),
+        )
+        return dict(result.payload or {})
+
+    @app.tool()
+    def ask_policy(question: str) -> dict[str, Any]:
+        """政策问答工具：返回答案与引用。"""
+        with _db_session(session_factory) as db:
+            return _invoke_tool(
+                db,
+                "ask_policy",
+                {
+                    "question": question,
+                },
+                raw_text=question,
             )
 
     @app.tool()
-    def add_ticket_comment(ticket_id: str, comment: str) -> dict[str, Any]:
-        """向现有工单追加说明，评论按 append-only 保存。"""
+    def create_ticket(
+        text: str,
+        fields: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """创建工单工具：支持按文本抽取并建单。"""
         with _db_session(session_factory) as db:
-            return services_mcp.invoke_ticket_tool(
+            return _invoke_tool(
                 db,
-                tool_name="add_ticket_comment",
-                args={"ticket_id": ticket_id, "comment": comment},
-                actor=normalized_actor,
-                raw_text=comment,
+                "create_ticket",
+                {
+                    "text": text,
+                    "fields": dict(fields or {}),
+                    "idempotency_key": str(idempotency_key or ""),
+                },
+                raw_text=text,
             )
 
     @app.tool()
-    def escalate_ticket(ticket_id: str, reason: str | None = None) -> dict[str, Any]:
-        """记录催办请求，并在允许时推进工单状态。"""
+    def continue_ticket_draft(
+        draft_id: str,
+        text: str,
+        fields: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """续办草稿工具：补充字段并继续执行建单流程。"""
         with _db_session(session_factory) as db:
-            args = {"ticket_id": ticket_id}
-            if reason is not None:
-                args["reason"] = reason
-            return services_mcp.invoke_ticket_tool(
+            return _invoke_tool(
                 db,
-                tool_name="escalate_ticket",
-                args=args,
-                actor=normalized_actor,
-                raw_text=reason or "",
+                "continue_ticket_draft",
+                {
+                    "draft_id": draft_id,
+                    "text": text,
+                    "fields": dict(fields or {}),
+                    "idempotency_key": str(idempotency_key or ""),
+                },
+                raw_text=text,
             )
 
     @app.tool()
-    def request_cancel_ticket(ticket_id: str, reason: str | None = None) -> dict[str, Any]:
-        """第一步：申请取消工单并获取 confirm_token。"""
+    def confirm_action(
+        confirm_token: str,
+        text: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """确认态工具：消费确认令牌并执行待确认动作。"""
         with _db_session(session_factory) as db:
-            return services_mcp.request_cancel_ticket_workflow(
+            return _invoke_tool(
                 db,
-                ticket_id=ticket_id,
-                actor=normalized_actor,
-                reason=reason,
+                "confirm_action",
+                {
+                    "confirm_token": confirm_token,
+                    "text": str(text or ""),
+                    "idempotency_key": str(idempotency_key or ""),
+                },
+                raw_text=str(text or ""),
             )
 
     @app.tool()
-    def confirm_cancel_ticket(confirm_token: str) -> dict[str, Any]:
-        """第二步：消费 confirm_token，真正执行取消。"""
+    def ticket_tool_planner(
+        ticket_id: str,
+        raw_text: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """工单工具规划器：按文本意图对目标工单执行 comment/escalate/cancel 等操作。"""
         with _db_session(session_factory) as db:
-            ticket_detail = services_mcp.confirm_cancel_ticket_workflow(
+            return _invoke_tool(
                 db,
-                confirm_token=confirm_token,
-                actor=normalized_actor,
+                "ticket_tool_planner",
+                {
+                    "ticket_id": ticket_id,
+                    "raw_text": raw_text,
+                    "idempotency_key": str(idempotency_key or ""),
+                },
+                raw_text=raw_text,
             )
-            return {
-                "message": "已取消工单。",
-                "ticket_detail": ticket_detail,
-            }
+
+    @app.tool()
+    def get_ticket_detail(ticket_id: str) -> dict[str, Any]:
+        """查询工单详情工具。"""
+        with _db_session(session_factory) as db:
+            return _invoke_tool(
+                db,
+                "get_ticket_detail",
+                {"ticket_id": ticket_id},
+                raw_text=f"MCP get detail {ticket_id}",
+            )
 
     return app
 
