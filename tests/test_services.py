@@ -28,6 +28,45 @@ from src.api.db import Base
 from src.api.schemas import ToolPlan
 
 
+@pytest.fixture(autouse=True)
+def _patch_default_ask_pipeline(monkeypatch) -> None:
+    """让服务层测试默认不访问真实 Qdrant/LLM。"""
+    default_hits = [
+        {
+            "doc_id": "henu_network_manual",
+            "page": 5,
+            "score": 0.88,
+            "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+        }
+    ]
+    default_output = {
+        "answer": "统一身份认证的登录地址是 https://ids.henu.edu.cn。",
+        "citations": [
+            {
+                "doc_id": "henu_network_manual",
+                "page": 5,
+                "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+            }
+        ],
+        "meta": {
+            "attempt_stage": "primary",
+            "json_ok": True,
+            "repair_used": False,
+            "failure_reason": None,
+        },
+    }
+    monkeypatch.setattr(
+        services.ask_pipeline,
+        "run_retrieve_step",
+        lambda question: ([dict(item) for item in default_hits], 0),
+    )
+    monkeypatch.setattr(
+        services.ask_pipeline,
+        "run_answer_step",
+        lambda question, hits: (dict(default_output), 0),
+    )
+
+
 
 def _build_test_session() -> Session:
     """创建独立的内存数据库会话，避免污染开发库。"""
