@@ -1,5 +1,8 @@
 services:
   api:
+    build:
+      args:
+        INSTALL_DEV: "1"
     command:
       [
         "uvicorn",
@@ -19,6 +22,9 @@ services:
       - model_cache:/root/.cache
 
   kb-init:
+    build:
+      args:
+        INSTALL_DEV: "1"
     volumes:
       - .:/app
       - model_cache:/root/.cache

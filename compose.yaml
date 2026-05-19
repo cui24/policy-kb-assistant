@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile.api
       args:
         INSTALL_MCP: "1"
+        INSTALL_DEV: "0"
     env_file:
       - .env
     environment:
@@ -42,6 +43,7 @@ services:
       dockerfile: Dockerfile.api
       args:
         INSTALL_MCP: "1"
+        INSTALL_DEV: "0"
     env_file:
       - .env
     environment:
@@ -70,6 +72,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
+      args:
+        INSTALL_DEV: "0"
     env_file:
       - .env
     environment:

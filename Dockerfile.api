@@ -7,14 +7,18 @@ ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG INSTALL_MCP=0
+ARG INSTALL_DEV=0
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 COPY requirements.txt /app/requirements.txt
 COPY requirements-mcp.txt /app/requirements-mcp.txt
+COPY requirements-ui.txt /app/requirements-ui.txt
+COPY requirements-dev.txt /app/requirements-dev.txt
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r /app/requirements.txt \
     && if [ "$INSTALL_MCP" = "1" ]; then python -m pip install -r /app/requirements-mcp.txt; fi
+RUN if [ "$INSTALL_DEV" = "1" ]; then python -m pip install -r /app/requirements-dev.txt; fi
 
 COPY . /app
 
