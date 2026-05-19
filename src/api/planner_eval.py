@@ -191,9 +191,28 @@ def _build_eval_session() -> Session:
 @contextmanager
 def _patched_eval_agent_dependencies():
     """给 workflow 评测装入稳定桩，避免真实检索/抽取依赖。"""
-    original_retrieve = services.retrieve
-    original_answer_with_citations = services.answer_with_citations
+    original_run_retrieve_step = services.ask_pipeline.run_retrieve_step
+    original_run_answer_step = services.ask_pipeline.run_answer_step
     original_extract_ticket_payload = services.extract_ticket_payload
+
+    default_hits = [
+        {
+            "doc_id": "planner_eval_stub_doc",
+            "page": 1,
+            "score": 0.9,
+            "snippet": "评测桩：缺地点和联系方式时应继续追问。",
+        }
+    ]
+    default_output = {
+        "answer": "这是评测桩答案。",
+        "citations": list(default_hits),
+        "meta": {
+            "attempt_stage": "planner_eval_stub",
+            "json_ok": True,
+            "repair_used": False,
+            "failure_reason": None,
+        },
+    }
 
     def _fake_extract_ticket_payload(text: str, user: str, department: str) -> dict[str, Any]:
         return {
@@ -209,30 +228,14 @@ def _patched_eval_agent_dependencies():
             "extractor": "planner_eval_stub",
         }
 
-    services.retrieve = lambda text: [  # type: ignore[assignment]
-        {
-            "doc_id": "planner_eval_stub_doc",
-            "page": 1,
-            "score": 0.9,
-            "snippet": "评测桩：缺地点和联系方式时应继续追问。",
-        }
-    ]
-    services.answer_with_citations = lambda text, hits: {  # type: ignore[assignment]
-        "answer": "这是评测桩答案。",
-        "citations": list(hits or []),
-        "meta": {
-            "attempt_stage": "planner_eval_stub",
-            "json_ok": True,
-            "repair_used": False,
-            "failure_reason": None,
-        },
-    }
+    services.ask_pipeline.run_retrieve_step = lambda question: (list(default_hits), 0)  # type: ignore[assignment]
+    services.ask_pipeline.run_answer_step = lambda question, hits: (dict(default_output), 0)  # type: ignore[assignment]
     services.extract_ticket_payload = _fake_extract_ticket_payload  # type: ignore[assignment]
     try:
         yield
     finally:
-        services.retrieve = original_retrieve  # type: ignore[assignment]
-        services.answer_with_citations = original_answer_with_citations  # type: ignore[assignment]
+        services.ask_pipeline.run_retrieve_step = original_run_retrieve_step  # type: ignore[assignment]
+        services.ask_pipeline.run_answer_step = original_run_answer_step  # type: ignore[assignment]
         services.extract_ticket_payload = original_extract_ticket_payload  # type: ignore[assignment]
 
 
