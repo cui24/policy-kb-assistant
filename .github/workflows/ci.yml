@@ -21,6 +21,7 @@ jobs:
             echo "OPENAI_API_KEY=dummy-ci-key"
             echo "AGENT_PLANNER_MODE=rules"
             echo "AGENT_MCP_CLIENT_ENABLED=false"
+            echo "CI_SKIP_KB_INGEST=1"
           } >> .env
 
       - name: Build and start Docker services

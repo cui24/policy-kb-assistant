@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${CI_SKIP_KB_INGEST:-0}" = "1" ]; then
+    echo "[KB-INIT] CI_SKIP_KB_INGEST=1, skip ingest by design"
+    exit 0
+fi
+
 if python - <<'PY'
 import json
 import os
