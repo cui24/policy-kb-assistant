@@ -20,6 +20,10 @@ langchain-text-splitters==1.1.1
 langgraph
 
 qdrant-client
+# Force CPU-only torch for local Docker builds. The default PyPI torch resolver
+# may pull multi-GB CUDA wheels, which are unnecessary for this project.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
 sentence-transformers
 pypdf
 tqdm

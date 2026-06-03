@@ -126,3 +126,42 @@ def test_invoke_tool_idempotent_replay_plan_rejected(monkeypatch) -> None:
     assert second.error_code == "plan_rejected"
     assert first.payload == second.payload
     assert calls["count"] == 1
+
+
+def test_invoke_tool_concurrency_limit_returns_retryable(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def _fake_dispatch_tool(_db: Any, _request: ToolCallRequest) -> tuple[dict[str, Any], str]:
+        calls["count"] += 1
+        return (
+            {
+                "route": "LOOKUP_TICKET",
+                "message": "ok",
+                "ticket": {"ticket_id": "TCK-1"},
+            },
+            "get_ticket_detail",
+        )
+
+    def _fake_acquire_slot():
+        raise executor.RateLimitedError("mcp_concurrency_limit_exceeded")
+
+    monkeypatch.setattr(executor, "dispatch_tool", _fake_dispatch_tool)
+    monkeypatch.setattr(executor, "_acquire_mcp_call_slot", _fake_acquire_slot)
+
+    result = executor.invoke_tool(
+        None,
+        ToolCallRequest(
+            tool="get_ticket_detail",
+            args={"ticket_id": "TCK-1"},
+            actor="alice",
+            actor_user_id="alice",
+            actor_role="user",
+            department="IT",
+            raw_text="查一下 TCK-1",
+        ),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "rate_limited"
+    assert result.retryable is True
+    assert calls["count"] == 0

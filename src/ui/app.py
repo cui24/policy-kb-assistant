@@ -74,21 +74,21 @@ from src.ui.api_client import APIClientError, PolicyAPIClient
 
 EXAMPLE_CASES = [
     {
-        "label": "一句话报修",
-        "text": "我宿舍网络连不上，帮我提交报修工单。地点金明校区，手机号13812345678。",
+        "label": "一句话建单",
+        "text": "我的办公电脑无法连接公司内网，帮我提交 IT 工单。地点北京总部 12 层工位 A1208，联系方式 13812345678。",
     },
     {
         "label": "仅问答",
-        "text": "统一身份认证的登录地址是什么？",
+        "text": "差旅报销流程是什么？",
     },
     {
         "label": "需补信息",
-        "text": "帮我提交网络报修工单，我宿舍上不了网。",
+        "text": "帮我提交网络故障工单，我的办公电脑连不上公司内网。",
     },
 ]
 
 TICKET_STATUS_OPTIONS = ["open", "in_progress", "resolved", "closed", "cancelled"]
-TICKET_CATEGORY_OPTIONS = ["network", "account", "dorm", "other"]
+TICKET_CATEGORY_OPTIONS = ["network", "account", "hardware", "permission", "other"]
 TICKET_PRIORITY_OPTIONS = ["P0", "P1", "P2", "P3"]
 
 
@@ -186,6 +186,31 @@ def _inject_styles() -> None:
           margin-right: 0.45rem;
           margin-bottom: 0.35rem;
         }
+        /* 状态/路由/优先级徽章：用底色 + 文字色编码语义，提升可扫描性。 */
+        .badge {
+          display: inline-block;
+          padding: 0.2rem 0.6rem;
+          border-radius: 999px;
+          font-size: 0.74rem;
+          font-weight: 700;
+          letter-spacing: 0.02em;
+          line-height: 1.5;
+          white-space: nowrap;
+        }
+        .badge-green  { background: #d9f2e3; color: #1d7a48; }
+        .badge-blue   { background: #dbeafe; color: #1d4ed8; }
+        .badge-amber  { background: #fdecc8; color: #9a6a00; }
+        .badge-red    { background: #fde2e2; color: #b42318; }
+        .badge-gray   { background: #e7e5df; color: #57534e; }
+        .badge-teal   { background: var(--accent-soft); color: var(--accent); }
+        .hero-subtitle code,
+        .hero-subtitle code * {
+          background: var(--accent-soft);
+          color: var(--accent);
+          padding: 0.05rem 0.35rem;
+          border-radius: 6px;
+          font-size: 0.86rem;
+        }
         .metric-box {
           border: 1px solid var(--line);
           border-radius: 14px;
@@ -208,6 +233,66 @@ def _inject_styles() -> None:
         unsafe_allow_html=True,
     )
 
+
+
+TICKET_STATUS_BADGE = {
+    "open": ("blue", "open"),
+    "in_progress": ("amber", "in progress"),
+    "resolved": ("green", "resolved"),
+    "closed": ("gray", "closed"),
+    "cancelled": ("gray", "cancelled"),
+}
+
+ROUTE_BADGE = {
+    "CREATE_TICKET": "green",
+    "ASK": "teal",
+    "NEED_MORE_INFO": "amber",
+    "DRAFT_EXPIRED": "red",
+    "DRAFT_NOT_FOUND": "red",
+    "LOOKUP_TICKET": "blue",
+    "ADD_TICKET_COMMENT": "blue",
+    "ESCALATE_TICKET": "amber",
+    "CANCEL_TICKET": "gray",
+}
+
+PRIORITY_BADGE = {"P0": "red", "P1": "amber", "P2": "blue", "P3": "gray"}
+
+
+def _badge_html(text: Any, variant: str = "teal") -> str:
+    """返回一个彩色徽章的 HTML 片段（不直接渲染，便于内联拼接）。"""
+    safe = html.escape(str(text if text not in (None, "") else "—"))
+    return f'<span class="badge badge-{variant}">{safe}</span>'
+
+
+def _status_badge_html(status: Any) -> str:
+    """工单状态徽章：按语义着色。"""
+    variant, label = TICKET_STATUS_BADGE.get(str(status or ""), ("gray", str(status or "—")))
+    return _badge_html(label, variant)
+
+
+def _route_badge_html(route: Any) -> str:
+    """Agent route 徽章。"""
+    return _badge_html(route, ROUTE_BADGE.get(str(route or ""), "gray"))
+
+
+def _priority_badge_html(priority: Any) -> str:
+    """工单优先级徽章。"""
+    return _badge_html(priority, PRIORITY_BADGE.get(str(priority or ""), "gray"))
+
+
+def _render_panel_card(meta_html: str, body_html: str, *, body_line_height: str = "1.7") -> None:
+    """渲染统一的列表条目卡片（citations / hits / audit 共用），避免重复内联 HTML。"""
+    st.markdown(
+        f"""
+        <div class="panel-card" style="padding:0.85rem 0.95rem; margin-bottom:0.7rem;">
+          <div style="font-size:0.82rem; color:rgba(20,33,61,0.64); margin-bottom:0.35rem;">
+            {meta_html}
+          </div>
+          <div style="line-height:{body_line_height}; color:#14213d;">{body_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_header() -> None:
@@ -259,9 +344,12 @@ def _ensure_state() -> None:
         "last_api_health": None,
         "trace_request_id": "",
         "trace_ticket_id": "",
+        "trace_ticket_id_input": "",
         "trace_kb_detail": None,
         "trace_audit_logs": [],
         "trace_ticket_detail": None,
+        "ops_metrics_hours": 24,
+        "last_ops_metrics": None,
         "active_draft_id": "",
         "active_draft_missing_fields": [],
         "draft_followup_location": "",
@@ -356,7 +444,7 @@ def _render_auth_page(client: PolicyAPIClient) -> None:
                         st.session_state["active_page"] = "Agent 主页"
                         client.set_access_token(token)
                         _clear_error()
-                        st.success("登录成功，正在跳转主页。")
+                        st.toast("登录成功，正在跳转主页。", icon="✅")
                         st.rerun()
 
     with register_tab:
@@ -396,7 +484,7 @@ def _render_auth_page(client: PolicyAPIClient) -> None:
                         st.session_state["active_page"] = "Agent 主页"
                         client.set_access_token(token)
                         _clear_error()
-                        st.success("注册成功，正在跳转主页。")
+                        st.toast("注册成功，正在跳转主页。", icon="✅")
                         st.rerun()
 
 
@@ -404,9 +492,18 @@ def _render_navigation_sidebar(client: PolicyAPIClient, auth_profile: dict[str, 
     """渲染登录后侧栏导航。"""
     with st.sidebar:
         st.header("导航")
+        nav_icons = {
+            "Agent 主页": "🤖 Agent 主页",
+            "手动问答": "💬 手动问答",
+            "手动建单": "📝 手动建单",
+            "工单管理": "📋 工单管理",
+            "审计追溯": "🔍 审计追溯",
+            "运行监控": "📈 运行监控",
+        }
         selected_page = st.radio(
             "选择页面",
-            options=["Agent 主页", "手动问答", "手动建单", "工单管理", "审计追溯"],
+            options=["Agent 主页", "手动问答", "手动建单", "工单管理", "审计追溯", "运行监控"],
+            format_func=lambda value: nav_icons.get(value, value),
             key="active_page",
         )
 
@@ -423,7 +520,7 @@ def _render_navigation_sidebar(client: PolicyAPIClient, auth_profile: dict[str, 
             else:
                 st.session_state["auth_user_profile"] = profile
                 _clear_error()
-                st.success("身份信息已刷新。")
+                st.toast("身份信息已刷新。", icon="🔄")
 
         if st.button("退出登录", use_container_width=True, key="logout_user"):
             _logout_user()
@@ -510,9 +607,10 @@ def _render_answer_block(answer_text: str) -> None:
 
 
 
-def _render_citations(citations: list[dict[str, Any]]) -> None:
+def _render_citations(citations: list[dict[str, Any]], *, show_header: bool = True) -> None:
     """渲染 citations 列表。"""
-    st.subheader("引用")
+    if show_header:
+        st.subheader("引用")
     if not citations:
         st.info("当前没有可展示的引用。若答案为拒答，这是正常情况。")
         return
@@ -521,23 +619,17 @@ def _render_citations(citations: list[dict[str, Any]]) -> None:
         doc_id = html.escape(str(item.get("doc_id") or ""))
         page = item.get("page")
         snippet = html.escape(str(item.get("snippet", "") or ""))
-        st.markdown(
-            f"""
-            <div class="panel-card" style="padding:0.85rem 0.95rem; margin-bottom:0.7rem;">
-              <div style="font-size:0.82rem; color:rgba(20,33,61,0.64); margin-bottom:0.35rem;">
-                引用 {index} · <strong>{doc_id}</strong> · 第 {page} 页
-              </div>
-              <div style="line-height:1.7; color:#14213d;">{snippet}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        _render_panel_card(
+            f"引用 {index} · <strong>{doc_id}</strong> · 第 {page} 页",
+            snippet,
         )
 
 
 
-def _render_hits(hits: list[dict[str, Any]]) -> None:
+def _render_hits(hits: list[dict[str, Any]], *, show_header: bool = True) -> None:
     """渲染 top-k 命中证据。"""
-    st.subheader("命中证据")
+    if show_header:
+        st.subheader("命中证据")
     if not hits:
         st.info("当前响应里没有返回检索证据。")
         return
@@ -547,33 +639,11 @@ def _render_hits(hits: list[dict[str, Any]]) -> None:
         doc_id = html.escape(str(hit.get("doc_id") or ""))
         page = hit.get("page")
         snippet = html.escape(str(hit.get("snippet", "") or ""))
-        st.markdown(
-            f"""
-            <div class="panel-card" style="padding:0.85rem 0.95rem; margin-bottom:0.7rem;">
-              <div style="font-size:0.82rem; color:rgba(20,33,61,0.64); margin-bottom:0.35rem;">
-                Top {index} · score={score:.3f} · <strong>{doc_id}</strong> · 第 {page} 页
-              </div>
-              <div style="line-height:1.65; color:#14213d;">{snippet}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-
-def _render_trace_block(request_id: str, meta: dict[str, Any]) -> None:
-    """用折叠区展示 request_id 和 trace 信息。"""
-    with st.expander("查看 Trace / Debug 信息"):
-        st.code(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "meta": meta,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            language="json",
+        _render_panel_card(
+            f"Top {index} · {_badge_html(f'score {score:.3f}', 'teal')} "
+            f"· <strong>{doc_id}</strong> · 第 {page} 页",
+            snippet,
+            body_line_height="1.65",
         )
 
 
@@ -587,15 +657,31 @@ def _render_kb_response(kb_response: dict[str, Any]) -> None:
     citations = kb_response.get("citations", []) or []
     meta = kb_response.get("meta", {}) or {}
     request_id = str(kb_response.get("request_id") or "")
+    retrieve_hits = meta.get("retrieve_topk", []) or []
 
     _render_answer_block(answer_text)
-    _render_citations(citations)
 
-    if request_id:
-        _render_trace_block(request_id, meta)
+    metric_left, metric_right = st.columns(2)
+    metric_left.metric("引用条数", len(citations))
+    metric_right.metric("命中证据", len(retrieve_hits))
 
-    retrieve_hits = meta.get("retrieve_topk", []) or []
-    _render_hits(retrieve_hits)
+    citations_tab, hits_tab, trace_tab = st.tabs(["引用", "命中证据", "Trace / Debug"])
+    with citations_tab:
+        _render_citations(citations, show_header=False)
+    with hits_tab:
+        _render_hits(retrieve_hits, show_header=False)
+    with trace_tab:
+        if request_id:
+            st.code(
+                json.dumps(
+                    {"request_id": request_id, "meta": meta},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                language="json",
+            )
+        else:
+            st.caption("本次响应未携带 request_id，无 Trace 信息。")
 
 
 
@@ -617,7 +703,7 @@ def _render_agent_response(agent_response: dict[str, Any]) -> None:
         f"""
         <div class="route-card">
           <div class="answer-label">AGENT ROUTE</div>
-          <div class="answer-text">{html.escape(route)}</div>
+          <div style="margin-top:0.15rem;">{_route_badge_html(route)}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -629,7 +715,7 @@ def _render_agent_response(agent_response: dict[str, Any]) -> None:
             <div class="ticket-card">
               <div class="answer-label" style="color:#9a6a00;">TICKET CREATED</div>
               <div class="answer-text">工单号：{html.escape(str(ticket.get('ticket_id') or ''))}</div>
-              <div style="margin-top:0.45rem; color:#7a5d14;">状态：{html.escape(str(ticket.get('status') or ''))}</div>
+              <div style="margin-top:0.45rem;">状态：{_status_badge_html(ticket.get('status'))}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1000,10 +1086,10 @@ def _render_manual_ticket_form(
     """渲染手动建单表单。"""
     st.subheader("手动建单（直接调用 /tickets）")
     with st.form("manual_ticket_form"):
-        title = st.text_input("标题", value="宿舍区无法上网")
+        title = st.text_input("标题", value="办公电脑无法连接公司内网")
         description = st.text_area(
             "描述",
-            value="用户描述：宿舍区断网，需要排查。",
+            value="用户描述：办公电脑无法连接公司内网，需要 IT 服务台排查网络或终端配置。",
             height=110,
         )
         form_left, form_right = st.columns(2)
@@ -1011,7 +1097,7 @@ def _render_manual_ticket_form(
             contact = st.text_input("联系方式", value="13812345678")
             category = st.selectbox("类别", options=TICKET_CATEGORY_OPTIONS, index=0)
         with form_right:
-            location = st.text_input("地点（会写入 context.location）", value="金明校区")
+            location = st.text_input("地点（会写入 context.location）", value="北京总部 12 层工位 A1208")
             priority = st.selectbox("优先级", options=TICKET_PRIORITY_OPTIONS, index=1)
 
         submitted = st.form_submit_button(
@@ -1054,13 +1140,20 @@ def _render_ticket_detail_card(ticket: dict[str, Any]) -> None:
         st.caption("选择或加载某个工单后，这里会显示详情。")
         return
 
+    badges = [f"状态 {_status_badge_html(ticket.get('status'))}"]
+    if ticket.get("priority"):
+        badges.append(f"优先级 {_priority_badge_html(ticket.get('priority'))}")
+    if ticket.get("category"):
+        badges.append(f"类别 {_badge_html(ticket.get('category'), 'gray')}")
+    badges_html = "&nbsp;&nbsp;".join(badges)
+
     st.markdown(
         f"""
         <div class="ticket-card">
           <div class="answer-label" style="color:#9a6a00;">TICKET DETAIL</div>
           <div class="answer-text">{html.escape(str(ticket.get('ticket_id') or ''))}</div>
+          <div style="margin-top:0.5rem;">{badges_html}</div>
           <div style="margin-top:0.4rem; color:#7a5d14; line-height:1.7;">
-            状态：{html.escape(str(ticket.get('status') or ''))}<br>
             标题：{html.escape(str(ticket.get('title') or ''))}<br>
             创建人：{html.escape(str(ticket.get('creator') or ''))}<br>
             处理人：{html.escape(str(ticket.get('assignee') or '未分配'))}<br>
@@ -1086,7 +1179,8 @@ def _render_ticket_manager(client: PolicyAPIClient, user_name: str, is_authentic
 
     refresh_list = st.button("刷新工单列表", use_container_width=True, key="refresh_ticket_list")
     if refresh_list:
-        _refresh_ticket_list(client, status_filter)
+        with st.spinner("正在刷新工单列表 ..."):
+            _refresh_ticket_list(client, status_filter)
 
     ticket_list = st.session_state.get("last_ticket_list") or []
     if ticket_list:
@@ -1120,7 +1214,8 @@ def _render_ticket_manager(client: PolicyAPIClient, user_name: str, is_authentic
             if not manual_ticket_id:
                 st.warning("请先选择或输入工单号。")
             else:
-                _load_ticket_detail(client, manual_ticket_id)
+                with st.spinner("正在查询工单详情 ..."):
+                    _load_ticket_detail(client, manual_ticket_id)
 
         ticket_detail = st.session_state.get("selected_ticket_detail")
         if isinstance(ticket_detail, dict):
@@ -1142,7 +1237,8 @@ def _render_ticket_manager(client: PolicyAPIClient, user_name: str, is_authentic
             if not manual_ticket_id:
                 st.warning("请先选择或输入工单号。")
             else:
-                _update_ticket_status(client, manual_ticket_id, new_status, user_name)
+                with st.spinner("正在更新工单状态 ..."):
+                    _update_ticket_status(client, manual_ticket_id, new_status, user_name)
 
 
 
@@ -1159,21 +1255,10 @@ def _render_audit_timeline(logs: list[dict[str, Any]]) -> None:
         action_type = html.escape(str(item.get("action_type") or ""))
         target_type = html.escape(str(item.get("target_type") or ""))
         target_id = html.escape(str(item.get("target_id") or ""))
-        st.markdown(
-            f"""
-            <div class="panel-card" style="padding:0.8rem 0.9rem; margin-bottom:0.65rem;">
-              <div style="font-size:0.8rem; color:rgba(20,33,61,0.64); margin-bottom:0.3rem;">
-                {created_at}
-              </div>
-              <div style="font-weight:700; color:#14213d; margin-bottom:0.25rem;">
-                {action_type} · {actor}
-              </div>
-              <div style="font-size:0.88rem; color:#14213d;">
-                {target_type} · {target_id}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        _render_panel_card(
+            created_at,
+            f'<div style="font-weight:700; margin-bottom:0.25rem;">{action_type} · {actor}</div>'
+            f'<div style="font-size:0.88rem;">{target_type} · {target_id}</div>',
         )
 
         with st.expander(f"查看日志载荷：{item.get('id')}"):
@@ -1182,18 +1267,27 @@ def _render_audit_timeline(logs: list[dict[str, Any]]) -> None:
 
 
 def _render_trace_explorer(client: PolicyAPIClient) -> None:
-    """渲染追溯区，支持按 request_id 或 ticket_id 回放链路。"""
+    """渲染追溯区：用户侧只输入工单号，内部自动关联 request_id。"""
     st.subheader("追溯 / 审计回放")
-    st.caption("输入 request_id 或 ticket_id 后，可回放问答记录、审计动作序列和关联工单。")
+    st.caption("输入工单号即可回放关联工单、问答记录和审计动作序列。")
 
-    trace_left, trace_right = st.columns(2)
-    with trace_left:
-        request_id = st.text_input("request_id", key="trace_request_id").strip()
-    with trace_right:
-        ticket_id = st.text_input("ticket_id", key="trace_ticket_id").strip()
+    ticket_id = st.text_input(
+        "工单号",
+        value=str(st.session_state.get("trace_ticket_id") or ""),
+        key="trace_ticket_id_input",
+        placeholder="例如：TCK-2026-AB12",
+    ).strip()
 
     if st.button("查询追溯链路", use_container_width=True, key="load_trace_bundle"):
-        _load_trace_bundle(client, request_id, ticket_id)
+        if not ticket_id:
+            st.warning("请先输入工单号。")
+        else:
+            with st.spinner("正在拉取追溯链路 ..."):
+                _load_trace_bundle(client, "", ticket_id)
+
+    resolved_ticket_id = str(st.session_state.get("trace_ticket_id") or "")
+    if resolved_ticket_id:
+        st.caption(f"当前回放工单：{resolved_ticket_id}")
 
     trace_ticket = st.session_state.get("trace_ticket_detail")
     if isinstance(trace_ticket, dict):
@@ -1201,7 +1295,8 @@ def _render_trace_explorer(client: PolicyAPIClient) -> None:
         _render_ticket_detail_card(trace_ticket)
         ticket_context = trace_ticket.get("context") or {}
         if isinstance(ticket_context, dict) and ticket_context.get("kb_request_id"):
-            st.caption(f"该工单关联的 kb_request_id：{ticket_context.get('kb_request_id')}")
+            with st.expander("查看内部链路 ID"):
+                st.code(str(ticket_context.get("kb_request_id")), language="text")
 
     trace_kb = st.session_state.get("trace_kb_detail")
     if isinstance(trace_kb, dict):
@@ -1237,7 +1332,7 @@ def _render_agent_home_page(
     agent_text = st.text_area(
         "输入一句话描述",
         height=130,
-        placeholder="例如：我宿舍网络连不上，帮我提交报修工单。地点金明校区，手机号138xxxx。",
+        placeholder="例如：我的办公电脑无法连接公司内网，帮我提交 IT 工单。地点北京总部 12 层工位 A1208，联系方式 138xxxx。",
         key="agent_input",
     )
 
@@ -1334,6 +1429,148 @@ def _render_audit_page(client: PolicyAPIClient) -> None:
     _render_trace_explorer(client)
 
 
+def _format_rate(value: Any) -> str:
+    """把 0-1 的比例格式化成百分比；异常值按 0% 展示。"""
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "0.0%"
+
+
+def _format_ms(value: Any) -> str:
+    """把毫秒数字格式化成 UI 中易扫读的文本。"""
+    try:
+        return f"{int(value)} ms"
+    except (TypeError, ValueError):
+        return "0 ms"
+
+
+def _format_cost_usd(value: Any) -> str:
+    """把美元成本格式化成较短文本；小额成本保留更多小数。"""
+    try:
+        return f"${float(value):.6f}"
+    except (TypeError, ValueError):
+        return "$0.000000"
+
+
+def _dict_to_rows(data: Any, key_label: str, value_label: str) -> list[dict[str, Any]]:
+    """把后端返回的分布字典转为 `st.dataframe` 可展示的行列表。"""
+    if not isinstance(data, dict):
+        return []
+    return [
+        {key_label: str(key), value_label: value}
+        for key, value in sorted(data.items(), key=lambda item: str(item[0]))
+    ]
+
+
+def _render_distribution_table(title: str, data: Any, key_label: str = "名称") -> None:
+    """渲染一张轻量分布表；空数据时给出占位提示。"""
+    st.markdown(f"**{title}**")
+    rows = _dict_to_rows(data, key_label, "数量")
+    if rows:
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+    else:
+        st.caption("当前统计窗口内暂无数据。")
+
+
+def _render_ops_page(client: PolicyAPIClient) -> None:
+    """渲染运行监控页，展示现有 `/ops/metrics` 聚合结果。"""
+    _render_error_card()
+    st.subheader("运行监控")
+    st.caption("演示环境直接展示监控数据；真实上线时可按用户角色只对管理员开放。")
+
+    left, right = st.columns([2, 1])
+    with left:
+        hours = st.slider(
+            "统计窗口（小时）",
+            min_value=1,
+            max_value=24 * 7,
+            value=int(st.session_state.get("ops_metrics_hours") or 24),
+            step=1,
+            key="ops_metrics_hours",
+        )
+    with right:
+        refresh = st.button("刷新监控", use_container_width=True, type="primary")
+
+    if refresh or not isinstance(st.session_state.get("last_ops_metrics"), dict):
+        try:
+            st.session_state["last_ops_metrics"] = client.ops_metrics(hours=hours)
+        except APIClientError as exc:
+            _set_error("调用 /ops/metrics", exc)
+            _render_error_card()
+            return
+        else:
+            _clear_error()
+            st.toast("运行监控已刷新。", icon="📈")
+
+    metrics = st.session_state.get("last_ops_metrics")
+    if not isinstance(metrics, dict):
+        st.info("点击刷新后，这里会展示最近一段时间的运行指标。")
+        return
+
+    ask = metrics.get("ask")
+    tickets = metrics.get("tickets")
+    ask_metrics = ask if isinstance(ask, dict) else {}
+    ticket_metrics = tickets if isinstance(tickets, dict) else {}
+
+    st.markdown("**ASK 问答链路**")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("请求总数", int(ask_metrics.get("total") or 0))
+    col2.metric("成功 / 失败", f"{int(ask_metrics.get('success') or 0)} / {int(ask_metrics.get('failure') or 0)}")
+    col3.metric("JSON 有效率", _format_rate(ask_metrics.get("valid_json_rate")))
+    col4.metric("引用输出率", _format_rate(ask_metrics.get("citation_rate")))
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("平均总延迟", _format_ms(ask_metrics.get("avg_total_ms")))
+    col6.metric("P95 总延迟", _format_ms(ask_metrics.get("p95_total_ms")))
+    col7.metric("Token 总量", int(ask_metrics.get("total_tokens") or 0))
+    col8.metric("估算成本", _format_cost_usd(ask_metrics.get("estimated_cost_usd")))
+
+    col9, col10, col11, col12 = st.columns(4)
+    col9.metric("平均检索延迟", _format_ms(ask_metrics.get("avg_retrieve_ms")))
+    col10.metric("平均回答延迟", _format_ms(ask_metrics.get("avg_answer_ms")))
+    col11.metric("JSON 修复率", _format_rate(ask_metrics.get("repair_rate")))
+    col12.metric("Fallback 比例", _format_rate(ask_metrics.get("fallback_rate")))
+
+    dist_left, dist_mid, dist_right = st.columns(3)
+    with dist_left:
+        _render_distribution_table("执行阶段分布", ask_metrics.get("attempt_stages"), "阶段")
+    with dist_mid:
+        _render_distribution_table("失败原因分布", ask_metrics.get("failure_reasons"), "原因")
+    with dist_right:
+        _render_distribution_table("模型分布", ask_metrics.get("models"), "模型")
+
+    st.divider()
+    st.markdown("**Agent / 工单链路**")
+    ticket_state = ticket_metrics.get("ticket_state") if isinstance(ticket_metrics.get("ticket_state"), dict) else {}
+    draft_state = ticket_metrics.get("draft_state") if isinstance(ticket_metrics.get("draft_state"), dict) else {}
+    confirmation_state = (
+        ticket_metrics.get("confirmation_state")
+        if isinstance(ticket_metrics.get("confirmation_state"), dict)
+        else {}
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("审计事件", int(ticket_metrics.get("total_audit_events") or 0))
+    col2.metric("失败/拒绝事件", int(ticket_metrics.get("failure_or_rejected_events") or 0))
+    col3.metric("工单总数", int(ticket_state.get("total") or 0))
+    col4.metric("草稿 / 确认", f"{int(draft_state.get('total') or 0)} / {int(confirmation_state.get('total') or 0)}")
+
+    ticket_left, ticket_mid, ticket_right = st.columns(3)
+    with ticket_left:
+        _render_distribution_table("Action 分布", ticket_metrics.get("action_counts"), "Action")
+        _render_distribution_table("工单状态", ticket_state.get("status_counts"), "状态")
+    with ticket_mid:
+        _render_distribution_table("Route 分布", ticket_metrics.get("route_counts"), "Route")
+        _render_distribution_table("草稿状态", draft_state.get("status_counts"), "状态")
+    with ticket_right:
+        _render_distribution_table("拒绝原因", ticket_metrics.get("rejection_reasons"), "原因")
+        _render_distribution_table("确认状态", confirmation_state.get("status_counts"), "状态")
+
+    with st.expander("查看原始监控 JSON"):
+        st.code(json.dumps(metrics, ensure_ascii=False, indent=2), language="json")
+
+
 def main() -> None:
     """渲染网页入口并驱动 UI -> API 的最小可用闭环。"""
     load_dotenv()
@@ -1370,8 +1607,10 @@ def main() -> None:
         _render_manual_ticket_page(client, user_name, department, is_authenticated=is_authenticated)
     elif selected_page == "工单管理":
         _render_ticket_management_page(client, user_name, is_authenticated=is_authenticated)
-    else:
+    elif selected_page == "审计追溯":
         _render_audit_page(client)
+    else:
+        _render_ops_page(client)
 
 
 if __name__ == "__main__":

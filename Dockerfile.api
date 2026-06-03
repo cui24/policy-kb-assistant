@@ -1,10 +1,13 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.10
 
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DEFAULT_TIMEOUT=120
+ENV PIP_RETRIES=10
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG INSTALL_MCP=0
 ARG INSTALL_DEV=0
@@ -15,10 +18,12 @@ COPY requirements-mcp.txt /app/requirements-mcp.txt
 COPY requirements-ui.txt /app/requirements-ui.txt
 COPY requirements-dev.txt /app/requirements-dev.txt
 
-RUN python -m pip install --upgrade pip \
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip,sharing=locked \
+    python -m pip install --upgrade pip \
     && python -m pip install -r /app/requirements.txt \
     && if [ "$INSTALL_MCP" = "1" ]; then python -m pip install -r /app/requirements-mcp.txt; fi
-RUN if [ "$INSTALL_DEV" = "1" ]; then python -m pip install -r /app/requirements-dev.txt; fi
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip,sharing=locked \
+    if [ "$INSTALL_DEV" = "1" ]; then python -m pip install -r /app/requirements-dev.txt; fi
 
 COPY . /app
 

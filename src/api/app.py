@@ -32,6 +32,7 @@ from src.api.routes.agent import router as agent_router
 from src.api.routes.auth import router as auth_router
 from src.api.routes.ask import router as ask_router
 from src.api.routes.history import router as history_router
+from src.api.routes.ops import router as ops_router
 from src.api.routes.tickets import router as tickets_router
 
 
@@ -74,3 +75,4 @@ app.include_router(tickets_router)
 app.include_router(agent_router)
 app.include_router(history_router)
 app.include_router(auth_router)
+app.include_router(ops_router)

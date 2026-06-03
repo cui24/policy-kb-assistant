@@ -3,7 +3,7 @@ ASK 业务节点。
 
 粒度定位：
 - 对 Agent 图来说，ASK 是单个业务节点。
-- 节点内部顺序执行：检索 -> 生成 -> 落库/审计 -> 响应组装。
+- 节点内部顺序执行：缓存命中检查 -> 检索/生成（未命中时）-> 落库/审计 -> 响应组装。
 """
 
 from __future__ import annotations
@@ -28,14 +28,7 @@ def run_ask_node(db: Session, state: AgentState) -> AgentState:
 
     request_id = str(ask_state.get("request_id") or ask_pipeline.new_request_id())
 
-    hits, retrieve_ms = ask_pipeline.run_retrieve_step(question)
-    output, answer_ms = ask_pipeline.run_answer_step(question, hits)
-    normalized = ask_pipeline.normalize_answer_payload(
-        output=output,
-        hits=hits,
-        retrieve_ms=retrieve_ms,
-        answer_ms=answer_ms,
-    )
+    normalized = ask_pipeline.run_cached_ask_steps(question, department)
 
     kb_query = ask_pipeline.persist_kb_query(
         db,

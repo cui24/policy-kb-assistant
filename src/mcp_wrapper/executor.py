@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 from typing import Any
 
@@ -31,6 +33,10 @@ from src.mcp_wrapper.registry import dispatch_tool, normalize_tool_name
 
 logger = logging.getLogger(__name__)
 
+_CONCURRENCY_LOCK = threading.Lock()
+_CONCURRENCY_LIMIT: int | None = None
+_CONCURRENCY_SEMAPHORE: threading.BoundedSemaphore | None = None
+
 
 FORBIDDEN_ARGUMENT_KEYS = {
     "is_admin",
@@ -53,6 +59,55 @@ IDEMPOTENT_TOOLS = {
     "confirm_action",
     "ticket_tool_planner",
 }
+
+
+def _mcp_max_concurrent_calls() -> int:
+    """读取单进程 MCP 工具并发上限；0 表示关闭本地闸门。"""
+    raw = str(os.getenv("MCP_WRAPPER_MAX_CONCURRENT_CALLS") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 16
+    return max(0, min(value, 1000))
+
+
+def _mcp_concurrency_wait_seconds() -> float:
+    """读取获取并发槽位的最长等待时间。"""
+    raw = str(os.getenv("MCP_WRAPPER_CONCURRENCY_WAIT_SECONDS") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.2
+    return max(0.0, min(value, 30.0))
+
+
+def _get_concurrency_semaphore() -> threading.BoundedSemaphore | None:
+    """按当前配置返回进程内并发闸门。"""
+    global _CONCURRENCY_LIMIT, _CONCURRENCY_SEMAPHORE
+    limit = _mcp_max_concurrent_calls()
+    if limit <= 0:
+        return None
+    with _CONCURRENCY_LOCK:
+        if _CONCURRENCY_SEMAPHORE is None or _CONCURRENCY_LIMIT != limit:
+            _CONCURRENCY_LIMIT = limit
+            _CONCURRENCY_SEMAPHORE = threading.BoundedSemaphore(limit)
+        return _CONCURRENCY_SEMAPHORE
+
+
+def _acquire_mcp_call_slot() -> threading.BoundedSemaphore | None:
+    """尝试获取一个工具执行槽位，超限时返回可重试限流错误。"""
+    semaphore = _get_concurrency_semaphore()
+    if semaphore is None:
+        return None
+
+    wait_seconds = _mcp_concurrency_wait_seconds()
+    if wait_seconds <= 0:
+        acquired = semaphore.acquire(blocking=False)
+    else:
+        acquired = semaphore.acquire(timeout=wait_seconds)
+    if not acquired:
+        raise RateLimitedError("mcp_concurrency_limit_exceeded")
+    return semaphore
 
 
 def _iter_forbidden_key_paths(data: Any, *, path: str = "") -> list[str]:
@@ -336,6 +391,7 @@ def invoke_tool(db: Session, request: ToolCallRequest) -> ToolCallResult:
         raw_text=request.raw_text,
     )
     idempotency_decision: IdempotencyDecision | None = None
+    acquired_semaphore: threading.BoundedSemaphore | None = None
     try:
         # 验证请求参数
         _validate_request(effective_request)
@@ -355,7 +411,13 @@ def invoke_tool(db: Session, request: ToolCallRequest) -> ToolCallResult:
             )
             return replay_result
 
-        payload_raw, normalized_tool = dispatch_tool(db, effective_request)
+        acquired_semaphore = _acquire_mcp_call_slot()
+        try:
+            payload_raw, normalized_tool = dispatch_tool(db, effective_request)
+        finally:
+            if acquired_semaphore is not None:
+                acquired_semaphore.release()
+                acquired_semaphore = None
         data = _normalize_payload(payload_raw)
         payload = _build_success_contract(
             raw_tool=raw_tool,
@@ -375,6 +437,8 @@ def invoke_tool(db: Session, request: ToolCallRequest) -> ToolCallResult:
         )
         return result
     except MCPToolError as exc:
+        if acquired_semaphore is not None:
+            acquired_semaphore.release()
         _abort_idempotent_execution(idempotency_decision)
         # 工具调用失败，返回PLAN_REJECTED结果
         payload = _build_error_contract(
@@ -403,6 +467,8 @@ def invoke_tool(db: Session, request: ToolCallRequest) -> ToolCallResult:
         )
         return result
     except (PermissionError, LookupError, ValueError) as exc:
+        if acquired_semaphore is not None:
+            acquired_semaphore.release()
         _abort_idempotent_execution(idempotency_decision)
         mapped = _map_known_exception(exc)
         assert mapped is not None
@@ -433,6 +499,8 @@ def invoke_tool(db: Session, request: ToolCallRequest) -> ToolCallResult:
         )
         return result
     except Exception as exc:
+        if acquired_semaphore is not None:
+            acquired_semaphore.release()
         _abort_idempotent_execution(idempotency_decision)
         # 工具调用失败，返回PLAN_REJECTED结果
         message = f"internal_error:{exc.__class__.__name__}"

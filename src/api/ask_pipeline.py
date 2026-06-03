@@ -16,9 +16,9 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from src.api import crud
-from src.kb.answer import answer_with_citations
-from src.kb.retrieve import retrieve
+from src.api import ask_cache, crud
+from src.kb.answer import answer_with_citations, answer_with_citations_async
+from src.kb.retrieve import retrieve, retrieve_async
 
 
 def new_request_id() -> str:
@@ -62,6 +62,68 @@ def run_answer_step(question: str, hits: list[dict]) -> tuple[dict[str, Any], in
     return output, latency_ms
 
 
+async def run_retrieve_step_async(question: str) -> tuple[list[dict], int]:
+    """执行异步检索步骤，返回命中和耗时（ms）。"""
+    started = time.perf_counter()
+    hits = await retrieve_async(question)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    return hits, latency_ms
+
+
+async def run_answer_step_async(question: str, hits: list[dict]) -> tuple[dict[str, Any], int]:
+    """执行异步回答步骤，返回模型输出和耗时（ms）。"""
+    started = time.perf_counter()
+    output = await answer_with_citations_async(question, hits)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    return output, latency_ms
+
+
+def run_cached_ask_steps(question: str, department: str | None = None) -> dict[str, Any]:
+    """执行可缓存的同步 ASK 中间步骤，供传统服务层和 LangGraph 共用。"""
+    cache_lookup = ask_cache.read_cached_answer(question, department)
+    if cache_lookup.normalized is not None:
+        return cache_lookup.normalized
+
+    hits, retrieve_ms = run_retrieve_step(question)
+    output, answer_ms = run_answer_step(question, hits)
+    normalized = normalize_answer_payload(
+        output=output,
+        hits=hits,
+        retrieve_ms=retrieve_ms,
+        answer_ms=answer_ms,
+    )
+    cache_status = ask_cache.write_cached_answer(
+        question,
+        department,
+        normalized,
+        key=cache_lookup.key,
+    )
+    return ask_cache.mark_cache_status(normalized, cache_lookup, status=cache_status)
+
+
+async def run_cached_ask_steps_async(question: str, department: str | None = None) -> dict[str, Any]:
+    """执行可缓存的异步 ASK 中间步骤，供 `/ask` 异步接口共用。"""
+    cache_lookup = ask_cache.read_cached_answer(question, department)
+    if cache_lookup.normalized is not None:
+        return cache_lookup.normalized
+
+    hits, retrieve_ms = await run_retrieve_step_async(question)
+    output, answer_ms = await run_answer_step_async(question, hits)
+    normalized = normalize_answer_payload(
+        output=output,
+        hits=hits,
+        retrieve_ms=retrieve_ms,
+        answer_ms=answer_ms,
+    )
+    cache_status = ask_cache.write_cached_answer(
+        question,
+        department,
+        normalized,
+        key=cache_lookup.key,
+    )
+    return ask_cache.mark_cache_status(normalized, cache_lookup, status=cache_status)
+
+
 def normalize_answer_payload(
     output: dict[str, Any],
     hits: list[dict],
@@ -83,6 +145,34 @@ def normalize_answer_payload(
     }
 
 
+def usage_metrics_from_meta(output_meta: dict[str, Any] | None) -> dict[str, Any]:
+    """从回答 meta 中提取可落库的 token 与成本指标。"""
+    meta = dict(output_meta or {})
+    usage = meta.get("usage")
+    usage_payload = dict(usage) if isinstance(usage, dict) else {}
+
+    def int_metric(key: str) -> int:
+        try:
+            return max(0, int(usage_payload.get(key, 0) or 0))
+        except Exception:
+            return 0
+
+    def float_metric(key: str) -> float:
+        try:
+            return max(0.0, float(meta.get(key, 0.0) or 0.0))
+        except Exception:
+            return 0.0
+
+    return {
+        "repair_used": bool(meta.get("repair_used", False)),
+        "prompt_tokens": int_metric("prompt_tokens"),
+        "completion_tokens": int_metric("completion_tokens"),
+        "total_tokens": int_metric("total_tokens"),
+        "token_usage_estimated": bool(meta.get("token_usage_estimated", False)),
+        "estimated_cost_usd": float_metric("estimated_cost_usd"),
+    }
+
+
 def persist_kb_query(
     db: Session,
     *,
@@ -95,6 +185,7 @@ def persist_kb_query(
 ):
     """把 ASK 结果落库到 kb_queries。"""
     output_meta = dict(normalized.get("output_meta") or {})
+    usage_metrics = usage_metrics_from_meta(output_meta)
     return crud.create_kb_query(
         db,
         {
@@ -112,6 +203,7 @@ def persist_kb_query(
             "model": model_name(),
             "valid_json": bool(output_meta.get("json_ok", False)),
             "failure_reason": output_meta.get("failure_reason"),
+            **usage_metrics,
         },
     )
 
@@ -141,6 +233,8 @@ def write_ask_audit(
             "answer": int(normalized.get("answer_ms") or 0),
         },
         "failure_reason": output_meta.get("failure_reason"),
+        "usage": usage_metrics_from_meta(output_meta),
+        "cache": ask_cache.cache_meta_from_output_meta(output_meta),
     }
     if streamed:
         payload["streamed"] = True
@@ -206,6 +300,8 @@ def build_kb_result(*, request_id: str, query_id: str, normalized: dict[str, Any
                 "retrieve": int(normalized.get("retrieve_ms") or 0),
                 "answer": int(normalized.get("answer_ms") or 0),
             },
+            "usage": usage_metrics_from_meta(output_meta),
+            "cache": ask_cache.cache_meta_from_output_meta(output_meta),
         },
     }
 

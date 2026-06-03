@@ -9,6 +9,18 @@ from src.api import ask_pipeline, models
 from src.api.db import Base
 
 
+def _patch_in_memory_ask_cache(monkeypatch) -> dict:
+    store: dict[str, dict] = {}
+
+    def _fake_set_json(key: str, value: dict, **kwargs) -> bool:
+        store[key] = value
+        return True
+
+    monkeypatch.setattr(ask_pipeline.ask_cache.redis_client, "get_json", lambda key: store.get(key))
+    monkeypatch.setattr(ask_pipeline.ask_cache.redis_client, "set_json", _fake_set_json)
+    return store
+
+
 def _build_test_session() -> Session:
     engine = create_engine(
         "sqlite:///:memory:",
@@ -31,6 +43,7 @@ def _working_memory_audits(db: Session) -> list[models.AuditLog]:
 
 
 def test_agent_graph_l0_working_memory_audits_ask_path(monkeypatch) -> None:
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "false")
     db = _build_test_session()
     try:
         monkeypatch.setattr(
@@ -85,6 +98,68 @@ def test_agent_graph_l0_working_memory_audits_ask_path(monkeypatch) -> None:
         assert payload["selected_tool"] == "kb_answer"
         assert payload["tool_result_summary"]["route"] == "ASK"
         assert "error_code" not in payload
+    finally:
+        db.close()
+
+
+def test_agent_graph_ask_node_uses_shared_redis_cache(monkeypatch) -> None:
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-graph-cache")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "answer": 0}
+
+    def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [
+            {
+                "doc_id": "henu_network_manual",
+                "page": 5,
+                "score": 0.88,
+                "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+            }
+        ], 12
+
+    def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "统一身份认证的登录地址是 https://ids.henu.edu.cn。",
+            "citations": [
+                {
+                    "doc_id": "henu_network_manual",
+                    "page": 5,
+                    "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                }
+            ],
+            "meta": {"attempt_stage": "primary", "json_ok": True},
+        }, 30
+
+    monkeypatch.setattr(ask_pipeline, "run_retrieve_step", _fake_retrieve)
+    monkeypatch.setattr(ask_pipeline, "run_answer_step", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first = run_agent_graph(
+            db,
+            text="统一身份认证的登录地址是什么？",
+            user="alice",
+            department="IT",
+            actor_user_id="alice",
+            actor_role="user",
+        )
+        second = run_agent_graph(
+            db,
+            text="  统一身份认证的登录地址是什么？  ",
+            user="alice",
+            department="IT",
+            actor_user_id="alice",
+            actor_role="user",
+        )
+
+        assert len(store) == 1
+        assert calls == {"retrieve": 1, "answer": 1}
+        assert first["kb"]["meta"]["cache"]["status"] == "stored"
+        assert second["kb"]["meta"]["cache"]["hit"] is True
+        assert second["kb"]["meta"]["attempt_stage"] == "cache_hit"
     finally:
         db.close()
 

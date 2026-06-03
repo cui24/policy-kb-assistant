@@ -45,13 +45,13 @@ L0 回答程序：基于检索证据调用 LLM，输出带引用的严格 JSON�
      - 失败：`None`
    - 作用：容忍模型在 JSON 前后夹带多余内容
 
-3. `_call_llm_final_only(client, model, messages, max_tokens) -> str`
+3. `_call_llm_final_only(client, model, messages, max_tokens) -> dict[str, Any]`
    - 输入：
      - `client`: `OpenAI`
      - `model`: `str`
      - `messages`: `list[{"role": str, "content": str}]`
      - `max_tokens`: `int`
-   - 输出：模型返回的最终文本内容 `str`
+   - 输出：模型返回的最终文本内容、token usage 与 usage 是否为估算值
    - 若接口超时或报错：抛出 `RuntimeError`
 
 4. `_normalize_output(data, evidence, max_snippet_chars) -> dict[str, Any]`
@@ -145,6 +145,7 @@ L0 回答程序：基于检索证据调用 LLM，输出带引用的严格 JSON�
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import AsyncIterator, Generator
@@ -339,13 +340,121 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _empty_usage() -> dict[str, int]:
+    """构造统一的 token usage 空对象。"""
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def _usage_value(usage: Any, key: str) -> int:
+    """兼容 OpenAI 对象和 dict 两种 usage 结构。"""
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        raw_value = usage.get(key, 0)
+    else:
+        raw_value = getattr(usage, key, 0)
+    try:
+        return max(0, int(raw_value or 0))
+    except Exception:
+        return 0
+
+
+def _usage_from_response(response: Any) -> tuple[dict[str, int], bool]:
+    """
+    从 OpenAI-compatible 响应中读取 token usage。
+
+    返回值第二项表示是否为估算值。这里读到官方 usage 时返回 False；
+    如果服务商没有返回 usage，调用方会再进入字符数估算路径。
+    """
+    usage = getattr(response, "usage", None)
+    prompt_tokens = _usage_value(usage, "prompt_tokens")
+    completion_tokens = _usage_value(usage, "completion_tokens")
+    total_tokens = _usage_value(usage, "total_tokens") or (prompt_tokens + completion_tokens)
+    if total_tokens <= 0:
+        return _empty_usage(), False
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }, False
+
+
+def _rough_token_count(text: str) -> int:
+    """在 API 未返回 usage 时，用字符数做保守粗估。"""
+    normalized = str(text or "")
+    if not normalized:
+        return 0
+    return max(1, int(math.ceil(len(normalized) / 2.0)))
+
+
+def _estimate_usage(messages: list[dict[str, str]], content: str) -> dict[str, int]:
+    """根据 prompt 文本和输出文本粗略估算 token usage。"""
+    prompt_text = "\n".join(str(message.get("content") or "") for message in messages)
+    prompt_tokens = _rough_token_count(prompt_text)
+    completion_tokens = _rough_token_count(content)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def _merge_usage(base: dict[str, int], addition: dict[str, int]) -> dict[str, int]:
+    """把多次模型调用的 usage 累加到同一个对象中。"""
+    merged = dict(base or _empty_usage())
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        merged[key] = int(merged.get(key, 0) or 0) + int(addition.get(key, 0) or 0)
+    return merged
+
+
+def _price_per_1m_tokens(env_name: str) -> float:
+    """读取每 100 万 token 的美元单价；未配置时按 0 计算。"""
+    raw_value = str(os.getenv(env_name) or "").strip()
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        return 0.0
+
+
+def _estimate_cost_usd(usage: dict[str, int]) -> float:
+    """
+    按配置的输入/输出 token 单价估算成本。
+
+    价格变化很频繁，所以这里不硬编码具体模型价格；部署或演示时可通过环境变量配置：
+    - LLM_INPUT_COST_PER_1M_USD
+    - LLM_OUTPUT_COST_PER_1M_USD
+    """
+    input_price = _price_per_1m_tokens("LLM_INPUT_COST_PER_1M_USD")
+    output_price = _price_per_1m_tokens("LLM_OUTPUT_COST_PER_1M_USD")
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    cost = (prompt_tokens / 1_000_000.0 * input_price) + (
+        completion_tokens / 1_000_000.0 * output_price
+    )
+    return round(cost, 8)
+
+
+def _llm_call_result(content: str, usage: dict[str, int], usage_estimated: bool) -> dict[str, Any]:
+    """统一包装一次模型调用结果。"""
+    return {
+        "content": str(content or "").strip(),
+        "usage": usage,
+        "usage_estimated": bool(usage_estimated),
+    }
+
+
+def _empty_llm_call_result() -> dict[str, Any]:
+    """构造一次失败模型调用的空结果。"""
+    return _llm_call_result("", _empty_usage(), False)
+
+
 def _call_llm_final_only(
     client: OpenAI,
     model: str,
     messages: list[dict[str, str]],
     max_tokens: int,
-) -> str:
-    """调用 OpenAI-compatible 接口，并只返回最终的文本内容。"""
+) -> dict[str, Any]:
+    """调用 OpenAI-compatible 接口，并返回文本内容与 token usage。"""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -356,7 +465,12 @@ def _call_llm_final_only(
     except Exception as exc:
         raise RuntimeError(f"llm_call_failed:{exc.__class__.__name__}") from exc
     message = response.choices[0].message
-    return (message.content or "").strip()
+    content = (message.content or "").strip()
+    usage, usage_estimated = _usage_from_response(response)
+    if int(usage.get("total_tokens", 0) or 0) <= 0:
+        usage = _estimate_usage(messages, content)
+        usage_estimated = True
+    return _llm_call_result(content, usage, usage_estimated)
 
 
 def _is_refusal_answer(answer: str) -> bool:
@@ -434,7 +548,7 @@ def _repair_output_to_json(
     evidence_block: str,
     raw_output: str,
     max_tokens: int,
-) -> str:
+) -> dict[str, Any]:
     """
     当第一次输出不是严格 JSON，或虽然可解析但结构不合格时，
     再发起一次“修复型提示”，要求模型只做结构化修复。
@@ -462,7 +576,7 @@ def _repair_output_to_json(
     try:
         return _call_llm_final_only(client, model, repair_messages, max_tokens)
     except RuntimeError:
-        return ""
+        return _empty_llm_call_result()
 
 
 def _attach_meta(
@@ -472,14 +586,20 @@ def _attach_meta(
     repair_used: bool,
     failure_reason: str | None,
     attempt_stage: str,
+    usage: dict[str, int] | None = None,
+    token_usage_estimated: bool = False,
 ) -> dict[str, Any]:
     """把调试和评测需要的元信息挂到返回结果中。"""
+    usage_payload = dict(usage or _empty_usage())
     enriched = dict(result)
     enriched["meta"] = {
         "json_ok": json_ok,
         "repair_used": repair_used,
         "failure_reason": failure_reason,
         "attempt_stage": attempt_stage,
+        "usage": usage_payload,
+        "token_usage_estimated": bool(token_usage_estimated),
+        "estimated_cost_usd": _estimate_cost_usd(usage_payload),
     }
     return enriched
 
@@ -932,10 +1052,15 @@ def answer_with_citations(
     ]
     repair_used = False
     last_failure_reason = "unknown"
+    total_usage = _empty_usage()
+    token_usage_estimated = False
 
     for attempt_model, attempt_max_tokens, attempt_stage in attempts:
         try:
-            content = _call_llm_final_only(client, attempt_model, messages, attempt_max_tokens)
+            call_result = _call_llm_final_only(client, attempt_model, messages, attempt_max_tokens)
+            content = str(call_result.get("content") or "")
+            total_usage = _merge_usage(total_usage, dict(call_result.get("usage") or {}))
+            token_usage_estimated = token_usage_estimated or bool(call_result.get("usage_estimated"))
         except RuntimeError as exc:
             last_failure_reason = str(exc)
             content = ""
@@ -964,6 +1089,8 @@ def answer_with_citations(
                             repair_used=repair_used,
                             failure_reason=None,
                             attempt_stage=f"{attempt_stage}_extractive",
+                            usage=total_usage,
+                            token_usage_estimated=token_usage_estimated,
                         )
                 return _attach_meta(
                     normalized,
@@ -971,6 +1098,8 @@ def answer_with_citations(
                     repair_used=repair_used,
                     failure_reason=None,
                     attempt_stage=attempt_stage,
+                    usage=total_usage,
+                    token_usage_estimated=token_usage_estimated,
                 )
             last_failure_reason = failure_reason or "invalid_output"
         else:
@@ -981,7 +1110,7 @@ def answer_with_citations(
         这里既处理“完全解析失败”，也处理“能解析但缺少 citations”等结构性问题。
         """
         if content and not repair_used:
-            repaired_content = _repair_output_to_json(
+            repair_result = _repair_output_to_json(
                 client,
                 fallback_model,
                 question,
@@ -990,6 +1119,9 @@ def answer_with_citations(
                 min(max_tokens, 1000),
             )
             repair_used = True
+            repaired_content = str(repair_result.get("content") or "")
+            total_usage = _merge_usage(total_usage, dict(repair_result.get("usage") or {}))
+            token_usage_estimated = token_usage_estimated or bool(repair_result.get("usage_estimated"))
             repaired_data = _extract_json(repaired_content)
             if isinstance(repaired_data, dict) and "answer" in repaired_data:
                 repaired_normalized = _normalize_output(repaired_data, evidence, max_snippet_chars)
@@ -1011,6 +1143,8 @@ def answer_with_citations(
                                 repair_used=True,
                                 failure_reason=None,
                                 attempt_stage=f"{attempt_stage}_repair_extractive",
+                                usage=total_usage,
+                                token_usage_estimated=token_usage_estimated,
                             )
                     return _attach_meta(
                         repaired_normalized,
@@ -1018,6 +1152,8 @@ def answer_with_citations(
                         repair_used=True,
                         failure_reason=None,
                         attempt_stage=f"{attempt_stage}_repair",
+                        usage=total_usage,
+                        token_usage_estimated=token_usage_estimated,
                     )
                 last_failure_reason = failure_reason or "repair_invalid_output"
             else:
@@ -1030,4 +1166,6 @@ def answer_with_citations(
         repair_used=repair_used,
         failure_reason=last_failure_reason,
         attempt_stage="fallback_refusal",
+        usage=total_usage,
+        token_usage_estimated=token_usage_estimated,
     )

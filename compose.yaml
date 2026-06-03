@@ -10,6 +10,7 @@ services:
       - .env
     environment:
       QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-policy_kb_l0}
       DATABASE_URL: postgresql+psycopg2://policy:policy@postgres:5432/policy_kb
       REDIS_URL: redis://redis:6379/0
       POLICY_API_BASE_URL: http://api:8080
@@ -78,7 +79,7 @@ services:
       - .env
     environment:
       QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: policy_kb_l0
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-policy_kb_l0}
       APP_LEVEL: l0
       KB_INIT_WAIT_SECONDS: "120"
     depends_on:

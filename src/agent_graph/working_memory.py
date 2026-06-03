@@ -1,4 +1,4 @@
-"""L0 Working Memory helpers.
+"""L0 工作记忆辅助函数。
 
 L0 只描述一次 Agent 请求执行中的临时状态：输入规范化、路由判断、
 引用恢复、工具选择、约束校验和工具结果摘要。它不落独立表，也不保存
@@ -16,15 +16,17 @@ _MESSAGE_PREVIEW_LIMIT = 180
 
 
 def _preview(value: Any, limit: int = _TEXT_PREVIEW_LIMIT) -> str:
+    """把任意值压缩成适合审计展示的短文本。"""
     return str(value or "").strip()[:limit]
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
+    """仅在输入本身是字典时返回副本，其他类型统一转为空字典。"""
     return dict(value) if isinstance(value, dict) else {}
 
 
 def update_working_memory(state: AgentState, **updates: Any) -> AgentState:
-    """Merge partial L0 fields into state."""
+    """把一组 L0 字段增量合并到当前图状态中。"""
     working = dict(state.get("working") or {})
     for key, value in updates.items():
         if value is not None:
@@ -40,7 +42,7 @@ def record_error(
     stage: str,
     reason: str | None = None,
 ) -> AgentState:
-    """Record a structured error reason for this request only."""
+    """记录本轮请求内可审计的结构化错误原因。"""
     return update_working_memory(
         state,
         error_code=str(code or "unknown_error"),
@@ -50,7 +52,7 @@ def record_error(
 
 
 def tool_args_preview(args: dict[str, Any] | None) -> dict[str, Any]:
-    """Build a safe, compact preview of tool args for L0/audit."""
+    """构造适合写入 L0/审计的安全工具参数摘要。"""
     preview: dict[str, Any] = {}
     for key, value in _safe_dict(args).items():
         if key == "confirm_token":
@@ -68,7 +70,7 @@ def tool_args_preview(args: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def tool_result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
-    """Build a compact tool result summary without large business payloads."""
+    """构造工具结果摘要，避免把大块业务载荷写入工作记忆。"""
     normalized = _safe_dict(result)
     ticket = _safe_dict(normalized.get("ticket"))
     draft = _safe_dict(normalized.get("draft"))
@@ -91,7 +93,7 @@ def tool_result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def audit_summary(state: AgentState) -> dict[str, Any]:
-    """Return the L0 fields safe enough to persist into audit payloads."""
+    """返回可以安全持久化到审计 payload 的 L0 字段。"""
     working = dict(state.get("working") or {})
     keys = (
         "request_id",

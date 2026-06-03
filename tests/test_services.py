@@ -31,6 +31,7 @@ from src.api.schemas import ToolPlan
 @pytest.fixture(autouse=True)
 def _patch_default_ask_pipeline(monkeypatch) -> None:
     """让服务层测试默认不访问真实 Qdrant/LLM。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "false")
     default_hits = [
         {
             "doc_id": "henu_network_manual",
@@ -134,6 +135,19 @@ def _patch_agent_dependencies(monkeypatch) -> None:
     )
 
 
+def _patch_in_memory_ask_cache(monkeypatch) -> dict:
+    """用内存字典替代 Redis，便于验证缓存命中/写入行为。"""
+    store: dict[str, dict] = {}
+
+    def _fake_set_json(key: str, value: dict, **kwargs) -> bool:
+        store[key] = value
+        return True
+
+    monkeypatch.setattr(services.ask_cache.redis_client, "get_json", lambda key: store.get(key))
+    monkeypatch.setattr(services.ask_cache.redis_client, "set_json", _fake_set_json)
+    return store
+
+
 
 def test_run_ask_workflow_persists_query_and_audit(monkeypatch) -> None:
     """问答工作流应写入一条问答记录和一条 ASK 审计日志。"""
@@ -190,6 +204,253 @@ def test_run_ask_workflow_persists_query_and_audit(monkeypatch) -> None:
         audit_records = crud.list_audit_logs(db, request_id=result["request_id"], limit=10)
         assert len(audit_records) == 1
         assert audit_records[0].action_type == "ASK"
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_uses_redis_cache_on_repeated_question(monkeypatch) -> None:
+    """重复非流式 ASK 应在第二次命中 Redis 缓存，但仍落库和审计。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-sync-cache")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "answer": 0}
+
+    def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [
+            {
+                "doc_id": "henu_network_manual",
+                "page": 5,
+                "score": 0.88,
+                "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+            }
+        ], 12
+
+    def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "统一身份认证的登录地址是 https://ids.henu.edu.cn。",
+            "citations": [
+                {
+                    "doc_id": "henu_network_manual",
+                    "page": 5,
+                    "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                }
+            ],
+            "meta": {
+                "attempt_stage": "primary",
+                "json_ok": True,
+                "repair_used": False,
+                "failure_reason": None,
+            },
+        }, 34
+
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first = services.run_ask_workflow(
+            db,
+            question="统一身份认证的登录地址是什么？",
+            user="alice",
+            department="IT",
+        )
+        second = services.run_ask_workflow(
+            db,
+            question="  统一身份认证的登录地址是什么？  ",
+            user="alice",
+            department="IT",
+        )
+
+        assert len(store) == 1
+        assert calls == {"retrieve": 1, "answer": 1}
+        assert first["meta"]["cache"]["hit"] is False
+        assert first["meta"]["cache"]["status"] == "stored"
+        assert second["meta"]["cache"]["hit"] is True
+        assert second["meta"]["attempt_stage"] == "cache_hit"
+        assert second["meta"]["latency_ms"] == {"retrieve": 0, "answer": 0}
+
+        kb_records = crud.list_kb_queries(db, user_name="alice", department="IT", limit=10)
+        assert len(kb_records) == 2
+        assert {record.request_id for record in kb_records} == {first["request_id"], second["request_id"]}
+
+        cached_audit = crud.list_audit_logs(db, request_id=second["request_id"], limit=10)[0]
+        assert cached_audit.payload_json["cache"]["hit"] is True
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_does_not_cache_failed_answer(monkeypatch) -> None:
+    """失败或非结构化回答不应写入 ASK 缓存。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-failed-cache")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "answer": 0}
+
+    def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [{"doc_id": "policy", "page": 1, "score": 0.1, "snippet": "弱相关"}], 3
+
+    def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "证据不足：无法回答。",
+            "citations": [],
+            "meta": {
+                "attempt_stage": "primary",
+                "json_ok": False,
+                "repair_used": False,
+                "failure_reason": "parse_failed",
+            },
+        }, 5
+
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first = services.run_ask_workflow(db, question="这个问题无法回答吗？", user="alice", department="IT")
+        second = services.run_ask_workflow(db, question="这个问题无法回答吗？", user="alice", department="IT")
+
+        assert store == {}
+        assert calls == {"retrieve": 2, "answer": 2}
+        assert first["meta"]["cache"]["status"] == "not_cacheable"
+        assert second["meta"]["cache"]["status"] == "not_cacheable"
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_cache_isolated_by_department(monkeypatch) -> None:
+    """同一个问题在不同部门下应生成不同缓存，避免跨业务域串答案。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-department-cache")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "answer": 0}
+
+    def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [
+            {
+                "doc_id": "finance_policy",
+                "page": 3,
+                "score": 0.91,
+                "snippet": "报销流程需要发票、审批单和付款凭证。",
+            }
+        ], 8
+
+    def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "报销流程通常需要发票、审批单和付款凭证。",
+            "citations": [
+                {
+                    "doc_id": "finance_policy",
+                    "page": 3,
+                    "snippet": "报销流程需要发票、审批单和付款凭证。",
+                }
+            ],
+            "meta": {
+                "attempt_stage": "primary",
+                "json_ok": True,
+                "repair_used": False,
+                "failure_reason": None,
+            },
+        }, 19
+
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first_it = services.run_ask_workflow(db, question="报销流程需要哪些材料？", user="alice", department="IT")
+        first_hr = services.run_ask_workflow(db, question="报销流程需要哪些材料？", user="alice", department="HR")
+        second_it = services.run_ask_workflow(db, question="报销流程需要哪些材料？", user="alice", department="IT")
+
+        assert len(store) == 2
+        assert calls == {"retrieve": 2, "answer": 2}
+        assert first_it["meta"]["cache"]["status"] == "stored"
+        assert first_hr["meta"]["cache"]["status"] == "stored"
+        assert second_it["meta"]["cache"]["hit"] is True
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_cache_namespace_busts_old_entries(monkeypatch) -> None:
+    """命名空间变化应让同一问题生成新 key，用于知识库/模型更新后的手动失效。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "kb-v1")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "answer": 0}
+
+    def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [{"doc_id": "it_policy", "page": 2, "score": 0.9, "snippet": "VPN 申请需要主管审批。"}], 7
+
+    def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "VPN 申请需要主管审批后提交。",
+            "citations": [{"doc_id": "it_policy", "page": 2, "snippet": "VPN 申请需要主管审批。"}],
+            "meta": {"attempt_stage": "primary", "json_ok": True, "failure_reason": None},
+        }, 16
+
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first = services.run_ask_workflow(db, question="VPN 怎么申请？", user="alice", department="IT")
+        second = services.run_ask_workflow(db, question="VPN 怎么申请？", user="alice", department="IT")
+        monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "kb-v2")
+        third = services.run_ask_workflow(db, question="VPN 怎么申请？", user="alice", department="IT")
+
+        assert len(store) == 2
+        assert calls == {"retrieve": 2, "answer": 2}
+        assert first["meta"]["cache"]["status"] == "stored"
+        assert second["meta"]["cache"]["hit"] is True
+        assert third["meta"]["cache"]["status"] == "stored"
+        assert third["meta"]["cache"]["hit"] is False
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_cache_fails_open_when_redis_errors(monkeypatch) -> None:
+    """Redis 读写异常时，ASK 主链路应继续检索和回答，而不是对用户报错。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-redis-error-cache")
+    calls = {"retrieve": 0, "answer": 0}
+
+    def _raise_redis_error(*args, **kwargs):
+        raise RuntimeError("redis_down")
+
+    def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [{"doc_id": "it_policy", "page": 9, "score": 0.85, "snippet": "账号解锁可联系 IT 服务台。"}], 6
+
+    def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "账号解锁可以联系 IT 服务台处理。",
+            "citations": [{"doc_id": "it_policy", "page": 9, "snippet": "账号解锁可联系 IT 服务台。"}],
+            "meta": {"attempt_stage": "primary", "json_ok": True, "failure_reason": None},
+        }, 15
+
+    monkeypatch.setattr(services.ask_cache.redis_client, "get_json", _raise_redis_error)
+    monkeypatch.setattr(services.ask_cache.redis_client, "set_json", _raise_redis_error)
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first = services.run_ask_workflow(db, question="账号锁定怎么办？", user="alice", department="IT")
+        second = services.run_ask_workflow(db, question="账号锁定怎么办？", user="alice", department="IT")
+
+        assert calls == {"retrieve": 2, "answer": 2}
+        assert first["answer"] == "账号解锁可以联系 IT 服务台处理。"
+        assert second["answer"] == "账号解锁可以联系 IT 服务台处理。"
+        assert first["meta"]["cache"]["status"] == "store_failed"
+        assert second["meta"]["cache"]["status"] == "store_failed"
     finally:
         db.close()
 
@@ -273,7 +534,7 @@ def test_run_ask_workflow_async_persists_query_and_audit(monkeypatch) -> None:
                     "score": 0.88,
                     "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
                 }
-            ]
+            ], 0
 
         async def _fake_answer(question: str, hits: list[dict]):
             return {
@@ -291,10 +552,10 @@ def test_run_ask_workflow_async_persists_query_and_audit(monkeypatch) -> None:
                     "repair_used": False,
                     "failure_reason": None,
                 },
-            }
+            }, 0
 
-        monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
-        monkeypatch.setattr(services, "answer_with_citations_async", _fake_answer)
+        monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step_async", _fake_retrieve)
+        monkeypatch.setattr(services.ask_pipeline, "run_answer_step_async", _fake_answer)
 
         result = asyncio.run(
             services.run_ask_workflow_async(
@@ -316,6 +577,74 @@ def test_run_ask_workflow_async_persists_query_and_audit(monkeypatch) -> None:
         audit_records = crud.list_audit_logs(db, request_id=result["request_id"], limit=10)
         assert len(audit_records) == 1
         assert audit_records[0].action_type == "ASK"
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_async_uses_redis_cache(monkeypatch) -> None:
+    """异步非流式 ASK 也应复用同一份 Redis 缓存。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-async-cache")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "answer": 0}
+
+    async def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [
+            {
+                "doc_id": "henu_network_manual",
+                "page": 5,
+                "score": 0.88,
+                "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+            }
+        ], 11
+
+    async def _fake_answer(question: str, hits: list[dict]):
+        calls["answer"] += 1
+        return {
+            "answer": "统一身份认证的登录地址是 https://ids.henu.edu.cn。",
+            "citations": [
+                {
+                    "doc_id": "henu_network_manual",
+                    "page": 5,
+                    "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                }
+            ],
+            "meta": {
+                "attempt_stage": "primary_async",
+                "json_ok": True,
+                "repair_used": False,
+                "failure_reason": None,
+            },
+        }, 22
+
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step_async", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step_async", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        first = asyncio.run(
+            services.run_ask_workflow_async(
+                db,
+                question="统一身份认证的登录地址是什么？",
+                user="alice",
+                department="IT",
+            )
+        )
+        second = asyncio.run(
+            services.run_ask_workflow_async(
+                db,
+                question="统一身份认证的登录地址是什么？",
+                user="alice",
+                department="IT",
+            )
+        )
+
+        assert len(store) == 1
+        assert calls == {"retrieve": 1, "answer": 1}
+        assert first["meta"]["cache"]["status"] == "stored"
+        assert second["meta"]["cache"]["hit"] is True
+        assert second["meta"]["attempt_stage"] == "cache_hit"
     finally:
         db.close()
 

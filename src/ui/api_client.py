@@ -192,6 +192,18 @@ class PolicyAPIClient:
         data = self._request("GET", "/health")
         return data if isinstance(data, dict) else {"raw": data}
 
+    def ops_metrics(self, hours: int = 24, pretty: bool = False) -> dict[str, Any]:
+        """调用 `GET /ops/metrics`，读取运行监控聚合数据。"""
+        data = self._request(
+            "GET",
+            "/ops/metrics",
+            params={
+                "hours": hours,
+                "pretty": pretty,
+            },
+        )
+        return data if isinstance(data, dict) else {"raw": data}
+
     def register(
         self,
         username: str,

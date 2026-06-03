@@ -42,7 +42,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.agent.ticket_extractor import extract_ticket_payload
-from src.api import ask_pipeline, crud, models
+from src.api import ask_cache, ask_pipeline, crud, models
 from src.api import planner
 from src.api.planner import PlannerError
 from src.api.schemas import (
@@ -59,7 +59,6 @@ from src.api.schemas import (
 from src.api.skills import get_ticket_tool_registry, list_global_planner_skills, list_ticket_tool_skills
 from src.kb.answer import (
     answer_with_citations,
-    answer_with_citations_async,
     stream_answer_with_citations_official,
     stream_answer_with_citations_official_async,
 )
@@ -401,14 +400,7 @@ def run_ask_workflow(
     actor_department = department or "general"
     resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
 
-    hits, retrieve_ms = ask_pipeline.run_retrieve_step(question)
-    output, answer_ms = ask_pipeline.run_answer_step(question, hits)
-    normalized = ask_pipeline.normalize_answer_payload(
-        output=output,
-        hits=hits,
-        retrieve_ms=retrieve_ms,
-        answer_ms=answer_ms,
-    )
+    normalized = ask_pipeline.run_cached_ask_steps(question, actor_department)
 
     kb_query = ask_pipeline.persist_kb_query(
         db,
@@ -449,20 +441,14 @@ async def run_ask_workflow_async(
     actor_department = department or "general"
     resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
 
-    retrieve_start = time.perf_counter()
-    hits = await retrieve_async(question)
-    retrieve_end = time.perf_counter()
+    normalized = await ask_pipeline.run_cached_ask_steps_async(question, actor_department)
 
-    answer_start = time.perf_counter()
-    output = await answer_with_citations_async(question, hits)
-    answer_end = time.perf_counter()
-
-    retrieve_ms = int((retrieve_end - retrieve_start) * 1000)
-    answer_ms = int((answer_end - answer_start) * 1000)
-
-    citations = output.get("citations", []) or []
-    output_meta = output.get("meta", {}) or {}
-    trace_hits = _trim_hits_for_trace(hits)
+    citations = list(normalized.get("citations") or [])
+    output_meta = dict(normalized.get("output_meta") or {})
+    usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
+    trace_hits = list(normalized.get("trace_hits") or [])
+    retrieve_ms = int(normalized.get("retrieve_ms") or 0)
+    answer_ms = int(normalized.get("answer_ms") or 0)
 
     kb_query = await crud.create_kb_query_async(
         db,
@@ -472,7 +458,7 @@ async def run_ask_workflow_async(
             "actor_user_id": resolved_actor_user_id,
             "department": actor_department,
             "question": question,
-            "answer": str(output.get("answer") or ""),
+            "answer": str(normalized.get("answer") or ""),
             "citations_json": citations,
             "retrieve_topk_json": trace_hits,
             "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
@@ -481,6 +467,7 @@ async def run_ask_workflow_async(
             "model": _model_name(),
             "valid_json": bool(output_meta.get("json_ok", False)),
             "failure_reason": output_meta.get("failure_reason"),
+            **usage_metrics,
         },
     )
 
@@ -500,6 +487,8 @@ async def run_ask_workflow_async(
                 "top_hit": trace_hits[0] if trace_hits else None,
                 "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
                 "failure_reason": output_meta.get("failure_reason"),
+                "usage": usage_metrics,
+                "cache": ask_cache.cache_meta_from_output_meta(output_meta),
             },
         },
     )
@@ -507,7 +496,7 @@ async def run_ask_workflow_async(
     return {
         "request_id": request_id,
         "query_id": kb_query.id,
-        "answer": str(output.get("answer") or ""),
+        "answer": str(normalized.get("answer") or ""),
         "citations": citations,
         "meta": {
             "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
@@ -516,6 +505,8 @@ async def run_ask_workflow_async(
             "failure_reason": output_meta.get("failure_reason"),
             "retrieve_topk": trace_hits,
             "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+            "usage": usage_metrics,
+            "cache": ask_cache.cache_meta_from_output_meta(output_meta),
         },
     }
 
@@ -581,6 +572,7 @@ def run_ask_workflow_stream(
 
     citations = output.get("citations", []) or []
     output_meta = output.get("meta", {}) or {}
+    usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
     trace_hits = _trim_hits_for_trace(hits)
 
     kb_query = crud.create_kb_query(
@@ -600,6 +592,7 @@ def run_ask_workflow_stream(
             "model": _model_name(),
             "valid_json": bool(output_meta.get("json_ok", False)),
             "failure_reason": output_meta.get("failure_reason"),
+            **usage_metrics,
         },
     )
 
@@ -619,6 +612,7 @@ def run_ask_workflow_stream(
                 "top_hit": trace_hits[0] if trace_hits else None,
                 "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
                 "failure_reason": output_meta.get("failure_reason"),
+                "usage": usage_metrics,
                 "streamed": True,
             },
         },
@@ -636,6 +630,7 @@ def run_ask_workflow_stream(
             "failure_reason": output_meta.get("failure_reason"),
             "retrieve_topk": trace_hits,
             "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+            "usage": usage_metrics,
         },
     }
     yield {"event": "final", "data": public_kb_response(result)}
@@ -699,6 +694,7 @@ async def run_ask_workflow_stream_async(
 
     citations = output.get("citations", []) or []
     output_meta = output.get("meta", {}) or {}
+    usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
     trace_hits = _trim_hits_for_trace(hits)
 
     kb_query = await crud.create_kb_query_async(
@@ -718,6 +714,7 @@ async def run_ask_workflow_stream_async(
             "model": _model_name(),
             "valid_json": bool(output_meta.get("json_ok", False)),
             "failure_reason": output_meta.get("failure_reason"),
+            **usage_metrics,
         },
     )
 
@@ -737,6 +734,7 @@ async def run_ask_workflow_stream_async(
                 "top_hit": trace_hits[0] if trace_hits else None,
                 "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
                 "failure_reason": output_meta.get("failure_reason"),
+                "usage": usage_metrics,
                 "streamed": True,
             },
         },
@@ -754,6 +752,7 @@ async def run_ask_workflow_stream_async(
             "failure_reason": output_meta.get("failure_reason"),
             "retrieve_topk": trace_hits,
             "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+            "usage": usage_metrics,
         },
     }
     yield {"event": "final", "data": public_kb_response(result)}
@@ -979,6 +978,12 @@ def serialize_kb_query(record) -> dict:
         "model": record.model,
         "valid_json": bool(record.valid_json),
         "failure_reason": record.failure_reason,
+        "repair_used": bool(getattr(record, "repair_used", False)),
+        "prompt_tokens": int(getattr(record, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(record, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(record, "total_tokens", 0) or 0),
+        "token_usage_estimated": bool(getattr(record, "token_usage_estimated", False)),
+        "estimated_cost_usd": float(getattr(record, "estimated_cost_usd", 0.0) or 0.0),
         "created_at": record.created_at.isoformat(),
     }
 

@@ -36,7 +36,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, String, Text, Enum
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, String, Text, Enum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -191,6 +191,12 @@ class KBQuery(Base):
     model: Mapped[str] = mapped_column(String(128), default="unknown")
     valid_json: Mapped[bool] = mapped_column(Boolean, default=False)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    repair_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    prompt_tokens: Mapped[int] = mapped_column(default=0)
+    completion_tokens: Mapped[int] = mapped_column(default=0)
+    total_tokens: Mapped[int] = mapped_column(default=0)
+    token_usage_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
 
 
 class AuditLog(Base):

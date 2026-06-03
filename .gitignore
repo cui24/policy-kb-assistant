@@ -35,7 +35,10 @@ htmlcov/
 .codex/
 .cursor/
 .cursorindexingignore
+.codegraph/
+.streamlit/
 .specstory/
+.understand-anything/
 cui24.github.io/
 study_test/
 current-freeze.txt

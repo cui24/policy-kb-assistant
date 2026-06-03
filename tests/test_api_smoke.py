@@ -2,8 +2,8 @@
 L3/L4 API smoke test：验证最小鉴权与草稿链路。
 
 一、测试目标
-1. 验证写接口在无 API Key 时返回 401。
-2. 验证带正确 API Key 时可正常创建工单。
+1. 验证写接口在无登录态时返回 401。
+2. 验证带 Bearer Token 时可正常创建工单。
 3. 验证读接口仍保持开放，便于演示和排障。
 4. 验证 `/agent` 能完成“创建草稿 -> 续办 -> 自动建单”的最小闭环。
 5. 验证 L4-2 的幂等与草稿所有权约束已通过 API 暴露正确语义。
@@ -17,6 +17,8 @@ L3/L4 API smoke test：验证最小鉴权与草稿链路。
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -26,10 +28,7 @@ import src.api.app as api_app_module
 from src.api.schemas import ToolPlan
 from src.api.db import Base
 from src.api.deps import get_db
-from src.api import crud, services
-
-
-_TEST_API_KEY = "test-api-key"
+from src.api import crud, models, services
 
 
 def _build_test_session() -> Session:
@@ -98,17 +97,24 @@ def _patch_agent_dependencies(monkeypatch) -> None:
         },
     )
 
-
-def _set_test_api_key(monkeypatch) -> None:
-    """为测试显式配置一个假的 API Key，避免依赖源码默认值。"""
-    monkeypatch.setenv("POLICY_API_KEY", _TEST_API_KEY)
+def _auth_headers(client: TestClient, username: str = "alice") -> dict[str, str]:
+    """注册测试用户并返回 Bearer 鉴权头。"""
+    response = client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "password": "TestPassword123",
+        },
+    )
+    assert response.status_code == 200
+    token = str(response.json()["access_token"])
+    return {"Authorization": f"Bearer {token}"}
 
 
 
 def test_ticket_api_requires_key_and_keeps_read_open(monkeypatch) -> None:
     """POST 应鉴权，GET 应开放，形成最小安全边界。"""
     db = _build_test_session()
-    _set_test_api_key(monkeypatch)
 
     def _override_get_db():
         """把请求绑定到测试会话。"""
@@ -122,25 +128,27 @@ def test_ticket_api_requires_key_and_keeps_read_open(monkeypatch) -> None:
 
     try:
         with TestClient(api_app_module.app) as client:
-            no_key_response = client.post(
+            no_token_response = client.post(
                 "/tickets",
                 json={
-                    "title": "未带鉴权头",
+                    "title": "未登录建单",
                     "description": "应被拒绝",
                 },
             )
-            assert no_key_response.status_code == 401
+            assert no_token_response.status_code == 401
 
-            with_key_response = client.post(
+            headers = _auth_headers(client, "alice")
+
+            with_token_response = client.post(
                 "/tickets",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers={**headers, "Idempotency-Key": "test-create-ticket-auth"},
                 json={
-                    "title": "带 Key 建单",
+                    "title": "登录后建单",
                     "description": "应成功创建",
                 },
             )
-            assert with_key_response.status_code == 200
-            payload = with_key_response.json()
+            assert with_token_response.status_code == 200
+            payload = with_token_response.json()
             assert str(payload["ticket_id"]).startswith("TCK-")
 
             list_response = client.get("/tickets")
@@ -148,7 +156,204 @@ def test_ticket_api_requires_key_and_keeps_read_open(monkeypatch) -> None:
             items = list_response.json()
             assert isinstance(items, list)
             assert len(items) == 1
-            assert items[0]["title"] == "带 Key 建单"
+            assert items[0]["title"] == "登录后建单"
+    finally:
+        api_app_module.app.dependency_overrides.clear()
+        db.close()
+
+
+def test_ops_metrics_summarizes_recent_kb_queries(monkeypatch) -> None:
+    """`/ops/metrics` should summarize existing ASK records without touching LLM calls."""
+    db = _build_test_session()
+    now = datetime.now(timezone.utc)
+
+    crud.create_kb_query(
+        db,
+        {
+            "request_id": "req_metrics_primary",
+            "created_at": now - timedelta(minutes=10),
+            "user_name": "alice",
+            "actor_user_id": "alice",
+            "department": "IT",
+            "question": "VPN 怎么申请？",
+            "answer": "按制度提交申请。",
+            "citations_json": [{"doc_id": "it", "page": 1, "snippet": "VPN 申请"}],
+            "retrieve_topk_json": [],
+            "attempt_stage": "primary",
+            "latency_retrieve_ms": 100,
+            "latency_answer_ms": 900,
+            "model": "deepseek-chat",
+            "valid_json": True,
+            "failure_reason": None,
+            "repair_used": False,
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+            "token_usage_estimated": False,
+            "estimated_cost_usd": 0.001,
+        },
+    )
+    crud.create_kb_query(
+        db,
+        {
+            "request_id": "req_metrics_repair",
+            "created_at": now - timedelta(minutes=5),
+            "user_name": "alice",
+            "actor_user_id": "alice",
+            "department": "IT",
+            "question": "报销制度是什么？",
+            "answer": "证据不足。",
+            "citations_json": [],
+            "retrieve_topk_json": [],
+            "attempt_stage": "primary_repair",
+            "latency_retrieve_ms": 200,
+            "latency_answer_ms": 1800,
+            "model": "deepseek-chat",
+            "valid_json": False,
+            "failure_reason": "parse_failed",
+            "repair_used": True,
+            "prompt_tokens": 200,
+            "completion_tokens": 100,
+            "total_tokens": 300,
+            "token_usage_estimated": True,
+            "estimated_cost_usd": 0.002,
+        },
+    )
+    crud.create_kb_query(
+        db,
+        {
+            "request_id": "req_metrics_old",
+            "created_at": now - timedelta(days=3),
+            "user_name": "alice",
+            "actor_user_id": "alice",
+            "department": "IT",
+            "question": "旧问题",
+            "answer": "旧答案",
+            "citations_json": [],
+            "retrieve_topk_json": [],
+            "attempt_stage": "fallback",
+            "latency_retrieve_ms": 999,
+            "latency_answer_ms": 999,
+            "model": "deepseek-chat",
+            "valid_json": False,
+            "failure_reason": "old_failure",
+            "repair_used": False,
+            "prompt_tokens": 999,
+            "completion_tokens": 999,
+            "total_tokens": 1998,
+            "token_usage_estimated": True,
+            "estimated_cost_usd": 0.999,
+        },
+    )
+    db.add(
+        models.Ticket(
+            public_id="TCK-2026-METRIC",
+            creator="alice",
+            creator_user_id="alice",
+            department="IT",
+            category="network",
+            priority="P1",
+            title="网络故障",
+            description="宿舍网络故障",
+            status="open",
+            source_draft_id="DRF-2026-METRIC",
+            context_json={},
+        )
+    )
+    db.add(
+        models.TicketDraft(
+            draft_id="DRF-2026-METRIC",
+            creator="alice",
+            owner_user_id="alice",
+            department="IT",
+            payload_json={},
+            missing_fields_json=[],
+            status="consumed",
+            expires_at=now + timedelta(minutes=20),
+            kb_request_id=None,
+        )
+    )
+    db.add(
+        models.PendingAction(
+            confirm_id="confirm-metric",
+            user_id="alice",
+            tool_name="cancel_ticket",
+            args_json={},
+            status="pending",
+            expires_at=now + timedelta(minutes=15),
+        )
+    )
+    db.commit()
+    crud.create_audit_log(
+        db,
+        {
+            "created_at": now - timedelta(minutes=4),
+            "actor": "alice",
+            "actor_user_id": "alice",
+            "action_type": "CREATE_TICKET",
+            "target_type": "TICKET",
+            "target_id": "TCK-2026-METRIC",
+            "request_id": "req_ticket_metric",
+            "payload_json": {"route": "CREATE_TICKET"},
+        },
+    )
+    crud.create_audit_log(
+        db,
+        {
+            "created_at": now - timedelta(minutes=3),
+            "actor": "alice",
+            "actor_user_id": "alice",
+            "action_type": "PLAN_REJECTED",
+            "target_type": "AGENT",
+            "target_id": "req_ticket_rejected",
+            "request_id": "req_ticket_rejected",
+            "payload_json": {"route": "PLAN_REJECTED", "error_code": "missing_ticket_id"},
+        },
+    )
+
+    def _override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
+    api_app_module.app.dependency_overrides[get_db] = _override_get_db
+
+    try:
+        with TestClient(api_app_module.app) as client:
+            response = client.get("/ops/metrics?hours=24")
+            assert response.status_code == 200
+            payload = response.json()
+            ask = payload["ask"]
+            assert payload["window_hours"] == 24
+            assert ask["total"] == 2
+            assert ask["success"] == 1
+            assert ask["failure"] == 1
+            assert ask["valid_json_rate"] == 0.5
+            assert ask["citation_rate"] == 0.5
+            assert ask["repair_rate"] == 0.5
+            assert ask["fallback_rate"] == 0.0
+            assert ask["avg_total_ms"] == 1500
+            assert ask["p50_total_ms"] == 1000
+            assert ask["p95_total_ms"] == 2000
+            assert ask["total_tokens"] == 450
+            assert ask["avg_tokens_per_request"] == 225
+            assert ask["token_usage_estimated_count"] == 1
+            assert ask["estimated_cost_usd"] == 0.003
+            assert ask["avg_estimated_cost_usd"] == 0.0015
+            assert ask["failure_reasons"] == {"parse_failed": 1}
+            assert ask["attempt_stages"] == {"primary": 1, "primary_repair": 1}
+            assert ask["models"] == {"deepseek-chat": 2}
+            tickets = payload["tickets"]
+            assert tickets["total_audit_events"] == 2
+            assert tickets["failure_or_rejected_events"] == 1
+            assert tickets["action_counts"] == {"CREATE_TICKET": 1, "PLAN_REJECTED": 1}
+            assert tickets["route_counts"] == {"CREATE_TICKET": 1, "PLAN_REJECTED": 1}
+            assert tickets["rejection_reasons"] == {"missing_ticket_id": 1}
+            assert tickets["ticket_state"]["status_counts"] == {"open": 1}
+            assert tickets["draft_state"]["status_counts"] == {"consumed": 1}
+            assert tickets["confirmation_state"]["status_counts"] == {"pending": 1}
     finally:
         api_app_module.app.dependency_overrides.clear()
         db.close()
@@ -158,7 +363,6 @@ def test_ticket_api_requires_key_and_keeps_read_open(monkeypatch) -> None:
 def test_agent_api_supports_idempotent_draft_resume(monkeypatch) -> None:
     """同一草稿连续提交两次时，API 应返回同一 ticket_id。"""
     db = _build_test_session()
-    _set_test_api_key(monkeypatch)
 
     def _override_get_db():
         """把请求绑定到测试会话。"""
@@ -172,9 +376,10 @@ def test_agent_api_supports_idempotent_draft_resume(monkeypatch) -> None:
 
     try:
         with TestClient(api_app_module.app) as client:
+            headers = _auth_headers(client, "alice")
             first_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={
                     "text": "我宿舍断网了，帮我报修工单。",
                     "user": "alice",
@@ -188,7 +393,7 @@ def test_agent_api_supports_idempotent_draft_resume(monkeypatch) -> None:
 
             second_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={
                     "text": "",
                     "user": "alice",
@@ -202,7 +407,7 @@ def test_agent_api_supports_idempotent_draft_resume(monkeypatch) -> None:
             )
             third_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={
                     "text": "",
                     "user": "alice",
@@ -235,7 +440,6 @@ def test_agent_api_supports_idempotent_draft_resume(monkeypatch) -> None:
 def test_agent_api_hides_forbidden_draft_as_not_found(monkeypatch) -> None:
     """其他用户拿到 draft_id 时，API 应返回 404，避免暴露草稿存在性。"""
     db = _build_test_session()
-    _set_test_api_key(monkeypatch)
 
     def _override_get_db():
         """把请求绑定到测试会话。"""
@@ -249,9 +453,11 @@ def test_agent_api_hides_forbidden_draft_as_not_found(monkeypatch) -> None:
 
     try:
         with TestClient(api_app_module.app) as client:
+            alice_headers = _auth_headers(client, "alice")
+            bob_headers = _auth_headers(client, "bob")
             first_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=alice_headers,
                 json={
                     "text": "我宿舍断网了，帮我报修工单。",
                     "user": "alice",
@@ -262,7 +468,7 @@ def test_agent_api_hides_forbidden_draft_as_not_found(monkeypatch) -> None:
 
             forbidden_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=bob_headers,
                 json={
                     "text": "",
                     "user": "bob",
@@ -284,7 +490,6 @@ def test_agent_api_hides_forbidden_draft_as_not_found(monkeypatch) -> None:
 def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
     """L5 工具接口应可直接调用，Agent 也能路由到查单。"""
     db = _build_test_session()
-    _set_test_api_key(monkeypatch)
 
     def _override_get_db():
         """把请求绑定到测试会话。"""
@@ -298,9 +503,10 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
     try:
         with TestClient(api_app_module.app) as client:
+            headers = _auth_headers(client, "alice")
             create_response = client.post(
                 "/tickets",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers={**headers, "Idempotency-Key": "test-create-ticket-tools"},
                 json={
                     "title": "L5 测试工单",
                     "description": "用于验证工具调用接口",
@@ -312,7 +518,7 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
             comment_response = client.post(
                 f"/tickets/{ticket_id}/comments",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={"actor": "alice", "comment": "补充：交换机在走廊"},
             )
             assert comment_response.status_code == 200
@@ -320,7 +526,7 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
             second_comment_response = client.post(
                 f"/tickets/{ticket_id}/comments",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={"actor": "bob", "comment": "补充：配线间门已打开"},
             )
             assert second_comment_response.status_code == 200
@@ -338,7 +544,7 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
             escalate_response = client.post(
                 f"/tickets/{ticket_id}/escalate",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={"actor": "alice", "reason": "请加急处理"},
             )
             assert escalate_response.status_code == 200
@@ -346,7 +552,7 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
             agent_lookup = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={
                     "text": f"帮我查一下工单 {ticket_id} 的状态",
                     "user": "alice",
@@ -360,7 +566,7 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
             cancel_response = client.post(
                 f"/tickets/{ticket_id}/cancel",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={"actor": "alice", "reason": "问题已自行恢复"},
             )
             assert cancel_response.status_code == 200
@@ -373,7 +579,6 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 def test_agent_api_llm_cancel_requires_confirmation_then_confirms(monkeypatch) -> None:
     """`/agent` 在 llm 模式下应返回 confirm_token，并可二次确认完成取消。"""
     db = _build_test_session()
-    _set_test_api_key(monkeypatch)
 
     def _override_get_db():
         try:
@@ -407,9 +612,10 @@ def test_agent_api_llm_cancel_requires_confirmation_then_confirms(monkeypatch) -
 
     try:
         with TestClient(api_app_module.app) as client:
+            headers = _auth_headers(client, "alice")
             create_response = client.post(
                 "/tickets",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers={**headers, "Idempotency-Key": "test-create-ticket-cancel"},
                 json={
                     "title": "待取消工单",
                     "description": "验证 confirm_token API",
@@ -420,7 +626,7 @@ def test_agent_api_llm_cancel_requires_confirmation_then_confirms(monkeypatch) -
 
             first_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={
                     "text": f"请取消工单 {ticket_id}",
                     "user": "alice",
@@ -434,7 +640,7 @@ def test_agent_api_llm_cancel_requires_confirmation_then_confirms(monkeypatch) -
 
             second_response = client.post(
                 "/agent",
-                headers={"X-API-Key": _TEST_API_KEY},
+                headers=headers,
                 json={
                     "text": "确认取消",
                     "user": "alice",

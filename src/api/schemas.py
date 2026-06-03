@@ -59,6 +59,8 @@ class AskMeta(BaseModel):
     failure_reason: str | None = None
     retrieve_topk: list[RetrieveHitItem]
     latency_ms: dict[str, int]
+    usage: dict[str, Any] = Field(default_factory=dict)
+    cache: dict[str, Any] = Field(default_factory=dict)
 
 
 class AskResponse(BaseModel):
@@ -289,6 +291,12 @@ class KBQueryDetailResponse(BaseModel):
     model: str
     valid_json: bool
     failure_reason: str | None = None
+    repair_used: bool = False
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    token_usage_estimated: bool = False
+    estimated_cost_usd: float = 0.0
     created_at: str
 
 

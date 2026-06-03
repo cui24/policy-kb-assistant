@@ -17,9 +17,16 @@ from streamlit.testing.v1 import AppTest
 _APP_PATH = Path(__file__).resolve().parents[1] / "src" / "ui" / "app.py"
 
 
-def _render_app() -> AppTest:
-    """加载页面并完成首轮渲染。"""
+def _render_app(authenticated: bool = True) -> AppTest:
+    """加载页面并完成首轮渲染；默认注入登录态以测试主功能页。"""
     app = AppTest.from_file(str(_APP_PATH))
+    if authenticated:
+        app.session_state["auth_access_token"] = "ui-smoke-token"
+        app.session_state["auth_user_profile"] = {
+            "username": "ui-smoke-user",
+            "role": "user",
+            "department": "IT",
+        }
     app.run()
     return app
 
@@ -32,13 +39,19 @@ def test_streamlit_app_renders_expected_controls() -> None:
 
     button_labels = [button.label for button in app.button]
     assert "调用 /agent" in button_labels
-    assert "仅问答（走 /agent）" in button_labels
-    assert "创建工单" in button_labels
-    assert "检测 API" in button_labels
+    assert "一句话建单" in button_labels
+    assert "仅问答" in button_labels
+    assert "需补信息" in button_labels
 
     text_area_labels = [text_area.label for text_area in app.text_area]
     assert "输入一句话描述" in text_area_labels
-    assert "描述" in text_area_labels
+
+    radio_options = [
+        option
+        for radio in app.radio
+        for option in getattr(radio, "options", [])
+    ]
+    assert any("运行监控" in option for option in radio_options)
 
 
 def test_streamlit_app_empty_agent_submit_shows_warning() -> None:
