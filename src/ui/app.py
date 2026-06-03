@@ -684,6 +684,41 @@ def _render_kb_response(kb_response: dict[str, Any]) -> None:
             st.caption("本次响应未携带 request_id，无 Trace 信息。")
 
 
+def _render_action_kb_trace(kb_response: dict[str, Any]) -> None:
+    """渲染动作型 Agent 路由关联的 KB 证据，避免把它误展示成最终答案。"""
+    if not kb_response:
+        return
+
+    meta = kb_response.get("meta", {}) or {}
+    request_id = str(kb_response.get("request_id") or "")
+    citations = kb_response.get("citations", []) or []
+    retrieve_hits = meta.get("retrieve_topk", []) or []
+
+    with st.expander("查看关联知识库证据 / Trace"):
+        st.caption("该信息用于审计追溯和证据关联；动作型请求的最终结果以上方工单状态为准。")
+        metric_left, metric_right = st.columns(2)
+        metric_left.metric("引用条数", len(citations))
+        metric_right.metric("命中证据", len(retrieve_hits))
+
+        citations_tab, hits_tab, trace_tab = st.tabs(["引用", "命中证据", "Trace / Debug"])
+        with citations_tab:
+            _render_citations(citations, show_header=False)
+        with hits_tab:
+            _render_hits(retrieve_hits, show_header=False)
+        with trace_tab:
+            if request_id:
+                st.code(
+                    json.dumps(
+                        {"request_id": request_id, "meta": meta},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    language="json",
+                )
+            else:
+                st.caption("本次响应未携带 request_id，无 Trace 信息。")
+
+
 
 def _render_agent_response(agent_response: dict[str, Any]) -> None:
     """根据 `/agent` 的 route 分支渲染不同结果。"""
@@ -751,7 +786,10 @@ def _render_agent_response(agent_response: dict[str, Any]) -> None:
         _render_ticket_detail_card(ticket_detail)
 
     if isinstance(kb_response, dict):
-        _render_kb_response(kb_response)
+        if route == "ASK":
+            _render_kb_response(kb_response)
+        else:
+            _render_action_kb_trace(kb_response)
 
 
 
