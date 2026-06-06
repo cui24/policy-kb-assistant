@@ -6,7 +6,16 @@ PYTHON_RUN = conda run -n $(CONDA_ENV) python
 ALEMBIC_RUN = PYTHONPATH=$(CURDIR) conda run -n $(CONDA_ENV) alembic
 
 # 声明伪目标：避免目录/同名文件与目标名冲突导致命令不执行
-.PHONY: up up-build dev-up dev-restart down dev-down download check-pdf smoke ingest retrieve demo regress test ui api mcp-install mcp-stdio mcp-http mcp-smoke compose-build-mcp db-upgrade db-current db-history db-revision grid-search ci-local ci-test ci-eval
+.PHONY: up up-build dev-up dev-restart down dev-down download check-pdf smoke ingest retrieve demo regress test ui api mcp-install mcp-stdio mcp-http mcp-smoke compose-build-mcp db-upgrade db-current db-history db-revision grid-search planner-json-dry-run planner-json-smoke planner-json-eval agent-e2e-workflow-eval ci-local ci-test ci-eval
+
+PLANNER_JSON_GROUPS ?= a,b,c
+PLANNER_JSON_LIMIT ?= 0
+PLANNER_JSON_OUTPUT ?= outputs/planner_json_compliance/abc_latest.json
+PLANNER_JSON_SCHEMA_FLAGS ?=
+AGENT_E2E_STRATEGY ?= hybrid
+AGENT_E2E_LIMIT ?= 0
+AGENT_E2E_OUTPUT ?= outputs/agent_e2e_workflow/docker_agent_e2e_latest.json
+AGENT_E2E_ABLATION ?= none
 
 # 部署版启动（不强制重建镜像）：已有镜像时更快，适合日常重启服务
 up:
@@ -137,6 +146,41 @@ db-revision:
 grid-search:
 	# 运行参数搜索模块，产出候选配置与评估结果
 	$(PYTHON_RUN) -m src.eval.grid_search_gate
+
+# 容器内 Planner JSON 合规评测：只校验 120 条 JSONL 测试集，不调用模型
+planner-json-dry-run:
+	docker compose -f compose.yaml -f compose.dev.yaml run --rm --no-deps api \
+		env PYTHONPATH=/app python scripts/evaluate_planner_json_compliance.py \
+			--dry-run \
+			--output outputs/planner_json_compliance/docker_dry_run.json
+
+# 容器内 Planner JSON 合规评测 smoke：默认每组跑前 2 条，验证模型 API 与脚本链路
+planner-json-smoke:
+	docker compose -f compose.yaml -f compose.dev.yaml run --rm --no-deps api \
+		env PYTHONPATH=/app python scripts/evaluate_planner_json_compliance.py \
+			--groups "$(PLANNER_JSON_GROUPS)" \
+			--limit 2 \
+			--output outputs/planner_json_compliance/docker_smoke_abc_limit2.json
+
+# 容器内 Planner JSON 合规评测全量：可传 PLANNER_JSON_LIMIT/OUTPUT/SCHEMA_FLAGS
+planner-json-eval:
+	docker compose -f compose.yaml -f compose.dev.yaml run --rm --no-deps api \
+		env PYTHONPATH=/app python scripts/evaluate_planner_json_compliance.py \
+			--groups "$(PLANNER_JSON_GROUPS)" \
+			--limit "$(PLANNER_JSON_LIMIT)" \
+			--output "$(PLANNER_JSON_OUTPUT)" \
+			$(PLANNER_JSON_SCHEMA_FLAGS)
+
+# 容器内 Agent workflow 端到端评测：自然语言 -> Agent workflow -> 最终 route
+agent-e2e-workflow-eval:
+	docker compose -f compose.yaml -f compose.dev.yaml run --rm --no-deps api \
+		env PYTHONPATH=/app python scripts/evaluate_global_planner.py \
+			--level workflow \
+			--strategy "$(AGENT_E2E_STRATEGY)" \
+			--cases data/agent/agent_e2e_workflow_cases.jsonl \
+			--ablation "$(AGENT_E2E_ABLATION)" \
+			--limit "$(AGENT_E2E_LIMIT)" \
+			--output "$(AGENT_E2E_OUTPUT)"
 
 # 容器内 CI：确定性测试 + 轻量质量评测
 ci-local: ci-test ci-eval

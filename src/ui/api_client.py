@@ -51,6 +51,7 @@ L3/L4 UI API 客户端：作为 Streamlit 页面访问后端 HTTP API 的唯一�
 from __future__ import annotations
 
 import os
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -89,6 +90,28 @@ def _parse_response_body(response: httpx.Response) -> Any:
         except Exception:
             return response.text
     return response.text
+
+
+def _parse_sse_event(raw_event: str) -> dict[str, Any] | None:
+    """解析一个 SSE event block。"""
+    event_name = "message"
+    data_lines: list[str] = []
+    for raw_line in raw_event.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:") :].strip() or "message"
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+    if not data_lines:
+        return None
+    data_text = "\n".join(data_lines)
+    try:
+        data = json.loads(data_text)
+    except Exception:
+        data = {"raw": data_text}
+    return {"event": event_name, "data": data}
 
 
 
@@ -258,6 +281,56 @@ class PolicyAPIClient:
             },
         )
         return data if isinstance(data, dict) else {"raw": data}
+
+    def ask_stream_events(
+        self,
+        question: str,
+        user: str | None = None,
+        department: str | None = None,
+    ):
+        """调用 `/ask/stream`，逐个产出 SSE 事件。"""
+        url = f"{self.base_url}/ask/stream"
+        headers = self._build_headers()
+        headers["Accept"] = "text/event-stream"
+        buffer = ""
+        try:
+            with httpx.Client(timeout=None) as client:
+                with client.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json={
+                        "question": question,
+                        "user": user,
+                        "department": department,
+                    },
+                ) as response:
+                    if response.status_code >= 400:
+                        response.read()
+                        parsed_body = _parse_response_body(response)
+                        raise APIClientError(
+                            message=_default_error_message(response.status_code),
+                            status_code=response.status_code,
+                            detail=parsed_body,
+                        )
+                    for chunk in response.iter_text():
+                        if not chunk:
+                            continue
+                        buffer += chunk
+                        while "\n\n" in buffer:
+                            raw_event, buffer = buffer.split("\n\n", 1)
+                            parsed = _parse_sse_event(raw_event)
+                            if parsed is not None:
+                                yield parsed
+                    if buffer.strip():
+                        parsed = _parse_sse_event(buffer)
+                        if parsed is not None:
+                            yield parsed
+        except httpx.RequestError as exc:
+            raise APIClientError(
+                message="无法连接到 L2 API。请确认 `make api` 正在运行，且 base_url 正确。",
+                detail=str(exc),
+            ) from exc
 
     def agent(
         self,

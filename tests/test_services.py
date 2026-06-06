@@ -4,7 +4,7 @@ L3/L4 服务层测试：覆盖 `services.py` 的核心工作流。
 一、测试目标
 1. 验证 `run_ask_workflow(...)` 会正确产出问答结果，并写入 `kb_queries` 与 `audit_logs`。
 2. 验证 `create_ticket_workflow(...)` 会创建工单并留下 CREATE_TICKET 审计记录。
-3. 验证 `run_agent_workflow(...)` 在直接建单路径上能串起 ASK、CREATE_TICKET、AGENT_ROUTE。
+3. 验证 `run_agent_workflow(...)` 在直接建单路径上不会执行 ASK，只保留工单链路审计。
 4. 验证 L4-2 的草稿续办具备幂等、所有权绑定与过期处理。
 
 二、测试隔离策略
@@ -754,41 +754,9 @@ def test_create_ticket_workflow_persists_ticket_and_audit() -> None:
 
 
 def test_run_agent_workflow_create_ticket_path_writes_full_chain(monkeypatch) -> None:
-    """Agent 直接建单路径应形成 ASK、CREATE_TICKET、AGENT_ROUTE 三段链路。"""
+    """Agent 直接建单路径不再执行 ASK，只保留工单链路审计。"""
     db = _build_test_session()
     try:
-        monkeypatch.setattr(
-            services,
-            "retrieve",
-            lambda text: [
-                {
-                    "doc_id": "henu_network_manual",
-                    "page": 3,
-                    "score": 0.91,
-                    "snippet": "宿舍区网络报修可联系服务大厅。",
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            services,
-            "answer_with_citations",
-            lambda text, hits: {
-                "answer": "建议先检查认证状态，如仍异常可提交网络报修。",
-                "citations": [
-                    {
-                        "doc_id": "henu_network_manual",
-                        "page": 3,
-                        "snippet": "宿舍区网络报修可联系服务大厅。",
-                    }
-                ],
-                "meta": {
-                    "attempt_stage": "primary",
-                    "json_ok": True,
-                    "repair_used": False,
-                    "failure_reason": None,
-                },
-            },
-        )
         monkeypatch.setattr(
             services,
             "extract_ticket_payload",
@@ -816,18 +784,21 @@ def test_run_agent_workflow_create_ticket_path_writes_full_chain(monkeypatch) ->
         assert result["route"] == "CREATE_TICKET"
         ticket_id = str(result["ticket"]["ticket_id"])
         assert ticket_id.startswith("TCK-")
-        assert result["kb"]["request_id"].startswith("req_")
+        assert "kb" not in result
 
         audit_stmt = select(models.AuditLog).order_by(models.AuditLog.created_at.asc())
         audit_logs = db.execute(audit_stmt).scalars().all()
         action_types = [item.action_type for item in audit_logs]
-        assert "ASK" in action_types
+        assert "ASK" not in action_types
         assert "CREATE_TICKET" in action_types
         assert "AGENT_ROUTE" in action_types
+        assert len(crud.list_kb_queries(db, limit=10)) == 0
 
         ticket = crud.get_ticket_by_public_id(db, ticket_id)
         assert ticket is not None
-        assert ticket.context_json.get("kb_request_id") == result["kb"]["request_id"]
+        assert str(ticket.context_json.get("agent_request_id") or "").startswith("req_")
+        assert "kb_request_id" not in ticket.context_json
+        assert "kb_attempt_stage" not in ticket.context_json
     finally:
         db.close()
 
@@ -877,7 +848,7 @@ def test_run_agent_workflow_draft_resume_is_idempotent(monkeypatch) -> None:
         ).scalars().all()
         assert len(tickets) == 1
 
-        chain_request_id = str(updated_draft.kb_request_id)
+        chain_request_id = str(updated_draft.agent_request_id)
         audit_records = crud.list_audit_logs(db, request_id=chain_request_id, limit=30)
         action_types = [item.action_type for item in audit_records]
         assert "DRAFT_CREATED" in action_types
@@ -914,7 +885,7 @@ def test_run_agent_workflow_draft_resume_rejects_foreign_user(monkeypatch) -> No
 
         draft = crud.get_ticket_draft_by_draft_id(db, draft_id)
         assert draft is not None
-        chain_request_id = str(draft.kb_request_id)
+        chain_request_id = str(draft.agent_request_id)
         audit_records = crud.list_audit_logs(db, request_id=chain_request_id, limit=20)
         action_types = [item.action_type for item in audit_records]
         assert "DRAFT_FORBIDDEN" in action_types
@@ -960,7 +931,7 @@ def test_run_agent_workflow_draft_resume_marks_expired(monkeypatch) -> None:
         assert updated_draft is not None
         assert updated_draft.status == "expired"
 
-        chain_request_id = str(updated_draft.kb_request_id)
+        chain_request_id = str(updated_draft.agent_request_id)
         audit_records = crud.list_audit_logs(db, request_id=chain_request_id, limit=20)
         action_types = [item.action_type for item in audit_records]
         assert "DRAFT_EXPIRED" in action_types
@@ -1085,7 +1056,7 @@ def test_ticket_tool_workflows_append_comments_and_update_context() -> None:
         assert escalated["status"] == "in_progress"
         assert int((escalated_again.get("context") or {}).get("escalation_count") or 0) == 2
 
-        cancelled = services.cancel_ticket_workflow(db, ticket_id, "alice", "用户已自行恢复")
+        cancelled = services.cancel_ticket_workflow(db, ticket_id, "alice", reason="用户已自行恢复")
         assert cancelled["status"] == "cancelled"
         assert (cancelled.get("context") or {}).get("cancel_reason") == "用户已自行恢复"
     finally:
@@ -1176,8 +1147,8 @@ def test_run_agent_workflow_routes_existing_ticket_tools() -> None:
         assert escalate["ticket"]["status"] == "in_progress"
 
         cancel = services.run_agent_workflow(db, text=f"请取消工单 {ticket_id}，因为已经恢复", user="alice", department="IT")
-        assert cancel["route"] == "CANCEL_TICKET"
-        assert cancel["ticket"]["status"] == "cancelled"
+        assert cancel["route"] == "NEED_CONFIRMATION"
+        assert str(cancel["confirm_token"] or "")
     finally:
         db.close()
 

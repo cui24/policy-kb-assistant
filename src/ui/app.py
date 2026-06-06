@@ -3,8 +3,8 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
 
 一、程序目标
 1. 让 Streamlit 页面不再直接调用 Python 函数，而是真正走 L2 HTTP API。
-2. 默认入口走 `/agent`，展示“一句话 -> 路由 -> 问答或建单”的完整链路。
-3. 页面默认自然语言入口统一走 `/agent`；只保留手动建单表单直调 `/tickets`。
+2. 默认入口是统一聊天页：问答走 `/ask/stream` 流式输出，工单操作走 `/agent` 直接返回。
+3. 保留手动问答直调 `/ask`、手动建单直调 `/tickets`，便于调试和对比。
 4. 提供工单列表、详情查询和状态更新，让 UI 真正接上 L2 后端。
 5. 提供追溯区：可按 `request_id` 或 `ticket_id` 回放问答、审计和关联工单。
 6. 在 L4 中支持草稿续办：`NEED_MORE_INFO` 后可直接补地点/联系方式继续提交。
@@ -18,8 +18,9 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
    2.4 在侧边栏读取 API 地址、默认用户、默认部门
    2.5 创建 `PolicyAPIClient`
    2.6 渲染主操作区：
-       - `/agent` 一句话入口
-       - 经 `/agent` 路由的“仅问答”入口
+       - 聊天页：`自动 / 问答 / 工单` 三模式
+       - `/ask/stream` 流式问答
+       - `/agent` 工单动作
        - `/tickets` 手动建单入口
    2.7 将最近一次 API 响应写入 `session_state`
    2.8 渲染问答结果、工单结果、抽取结果、Trace 信息
@@ -29,10 +30,11 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
 
 三、输入输出数据格式
 1. UI 输入：
-   - `text`: 一句话自然语言输入，走 `/agent`
-   - `question`: 问答输入，仍走 `/agent`
+   - `chat text`: 聊天输入，按模式分流到 `/ask/stream` 或 `/agent`
+   - `question`: 手动问答输入，走 `/ask`
    - `ticket form`: 手动建单字段，走 `/tickets`
 2. API 输出：
+   - `/ask/stream`: SSE token/status/final 事件
    - `/agent`: `AgentResponse`
    - `/tickets`: `TicketResponse` / `TicketDetailResponse`
 3. 页面状态：
@@ -41,8 +43,8 @@ L3/L4 Web 演示程序：提供“UI 通过 HTTP 调用后端 API”的最小可
 四、程序可以理解成的伪代码
 1. 让用户先配置 API 地址和默认身份
 2. 创建 API 客户端
-3. 用户点“一句话入口”就调 `/agent`
-4. 用户点“仅问答”仍走 `/agent`，由后端路由成问答
+3. 用户在聊天页发送消息后，问答走 `/ask/stream`，工单走 `/agent`
+4. 用户也可以进入手动问答页直调 `/ask`
 5. 用户提交手动工单表单就调 `/tickets`
 6. 页面根据返回 JSON 决定展示：
    - answer + citations
@@ -72,24 +74,18 @@ from dotenv import load_dotenv
 from src.ui.api_client import APIClientError, PolicyAPIClient
 
 
-EXAMPLE_CASES = [
-    {
-        "label": "一句话建单",
-        "text": "我的办公电脑无法连接公司内网，帮我提交 IT 工单。地点北京总部 12 层工位 A1208，联系方式 13812345678。",
-    },
-    {
-        "label": "仅问答",
-        "text": "差旅报销流程是什么？",
-    },
-    {
-        "label": "需补信息",
-        "text": "帮我提交网络故障工单，我的办公电脑连不上公司内网。",
-    },
-]
-
 TICKET_STATUS_OPTIONS = ["open", "in_progress", "resolved", "closed", "cancelled"]
 TICKET_CATEGORY_OPTIONS = ["network", "account", "hardware", "permission", "other"]
 TICKET_PRIORITY_OPTIONS = ["P0", "P1", "P2", "P3"]
+NAVIGATION_PAGES = ["聊天", "手动问答", "手动建单", "工单管理", "审计追溯", "运行监控"]
+CHAT_MODE_OPTIONS = ["自动", "问答", "工单"]
+DEFAULT_CHAT_INPUT_BY_MODE = {
+    "自动": "新员工申请开通 ERP 系统账户，从审批通过到技术支持开通权限一般需要多久？",
+    "问答": "新员工申请开通 ERP 系统账户，从审批通过到技术支持开通权限一般需要多久？",
+    "工单": "我的办公电脑无法连接公司内网，帮我提交 IT 工单。地点北京总部 12 层工位 A1208，联系方式 13812345678。",
+}
+DEFAULT_CHAT_INPUT_TEXT = DEFAULT_CHAT_INPUT_BY_MODE["自动"]
+OLD_CHAT_INPUT_DEFAULTS = {"员工可以通过哪些渠道进行投诉举报？"}
 
 
 
@@ -99,26 +95,40 @@ def _inject_styles() -> None:
         """
         <style>
         :root {
-          --ink: #14213d;
-          --accent: #0b8f8c;
-          --accent-soft: #d7f5ef;
-          --paper: #fffaf2;
-          --line: #d7d3c7;
-          --warm: #f3b73f;
-          --danger-soft: #fde7e7;
-          --danger-ink: #8f2929;
+          --ink: #172033;
+          --muted: #536276;
+          --accent: #0f5fb8;
+          --accent-soft: #dbeafe;
+          --paper: #eef2f7;
+          --surface: #ffffff;
+          --surface-alt: #f8fafc;
+          --line: #9aa8ba;
+          --line-strong: #64748b;
+          --warm: #d97706;
+          --warm-soft: #ffedd5;
+          --danger-soft: #fee2e2;
+          --danger-ink: #991b1b;
         }
         .stApp {
-          background:
-            radial-gradient(circle at top left, rgba(243,183,63,0.16), transparent 34%),
-            radial-gradient(circle at top right, rgba(11,143,140,0.14), transparent 30%),
-            linear-gradient(180deg, #fffdf8 0%, var(--paper) 100%);
+          background: var(--paper);
           color: var(--ink);
+        }
+        section[data-testid="stSidebar"] {
+          background: #d8dee8;
+          border-right: 2px solid var(--line-strong);
+        }
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] p {
+          color: #172033;
         }
         .block-container {
           padding-top: 2rem;
           padding-bottom: 3rem;
           max-width: 1180px;
+        }
+        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stHorizontalBlock"]) {
+          border-color: transparent;
         }
         .hero-card,
         .panel-card,
@@ -126,14 +136,16 @@ def _inject_styles() -> None:
         .error-card,
         .route-card,
         .ticket-card {
-          border: 1px solid var(--line);
-          border-radius: 18px;
-          background: rgba(255, 255, 255, 0.92);
-          box-shadow: 0 12px 32px rgba(20, 33, 61, 0.07);
+          border: 2px solid var(--line);
+          border-radius: 10px;
+          background: var(--surface);
+          box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
         }
         .hero-card {
           padding: 1.2rem 1.25rem 1rem 1.25rem;
           margin-bottom: 1rem;
+          border-color: #7c3aed;
+          background: #f5f3ff;
         }
         .hero-title {
           font-size: 1.8rem;
@@ -142,7 +154,7 @@ def _inject_styles() -> None:
           margin-bottom: 0.35rem;
         }
         .hero-subtitle {
-          color: rgba(20, 33, 61, 0.74);
+          color: var(--muted);
           line-height: 1.55;
           font-size: 0.98rem;
         }
@@ -154,14 +166,28 @@ def _inject_styles() -> None:
           margin-bottom: 0.8rem;
         }
         .answer-card {
-          border-left: 6px solid var(--accent);
+          border-color: #2563eb;
+          border-left: 8px solid #2563eb;
+          background: #eff6ff;
         }
         .error-card {
-          border-left: 6px solid #c94c4c;
-          background: rgba(253, 241, 241, 0.96);
+          border-color: #dc2626;
+          border-left: 8px solid #dc2626;
+          background: #fef2f2;
         }
         .ticket-card {
-          border-left: 6px solid var(--warm);
+          border-color: #d97706;
+          border-left: 8px solid var(--warm);
+          background: #fff7ed;
+        }
+        .route-card {
+          border-color: #0891b2;
+          border-left: 8px solid #0891b2;
+          background: #ecfeff;
+        }
+        .panel-card {
+          background: var(--surface-alt);
+          border-color: #94a3b8;
         }
         .answer-label {
           font-size: 0.78rem;
@@ -197,11 +223,11 @@ def _inject_styles() -> None:
           line-height: 1.5;
           white-space: nowrap;
         }
-        .badge-green  { background: #d9f2e3; color: #1d7a48; }
-        .badge-blue   { background: #dbeafe; color: #1d4ed8; }
-        .badge-amber  { background: #fdecc8; color: #9a6a00; }
-        .badge-red    { background: #fde2e2; color: #b42318; }
-        .badge-gray   { background: #e7e5df; color: #57534e; }
+        .badge-green  { background: #bbf7d0; color: #166534; border: 1px solid #22c55e; }
+        .badge-blue   { background: #bfdbfe; color: #1e40af; border: 1px solid #3b82f6; }
+        .badge-amber  { background: #fed7aa; color: #9a3412; border: 1px solid #f97316; }
+        .badge-red    { background: #fecaca; color: #991b1b; border: 1px solid #ef4444; }
+        .badge-gray   { background: #e2e8f0; color: #334155; border: 1px solid #94a3b8; }
         .badge-teal   { background: var(--accent-soft); color: var(--accent); }
         .hero-subtitle code,
         .hero-subtitle code * {
@@ -212,10 +238,10 @@ def _inject_styles() -> None:
           font-size: 0.86rem;
         }
         .metric-box {
-          border: 1px solid var(--line);
-          border-radius: 14px;
+          border: 2px solid #94a3b8;
+          border-radius: 10px;
           padding: 0.75rem 0.9rem;
-          background: rgba(255,255,255,0.88);
+          background: #ffffff;
           margin-bottom: 0.7rem;
         }
         .metric-title {
@@ -227,6 +253,88 @@ def _inject_styles() -> None:
           color: var(--ink);
           font-size: 1rem;
           font-weight: 700;
+        }
+        .chat-row {
+          display: flex;
+          width: 100%;
+          margin: 0.55rem 0 0.8rem 0;
+          align-items: flex-start;
+          gap: 0.55rem;
+        }
+        .chat-row-user {
+          justify-content: flex-end;
+        }
+        .chat-row-assistant {
+          justify-content: flex-start;
+        }
+        .chat-avatar {
+          flex: 0 0 auto;
+          width: 2rem;
+          height: 2rem;
+          border-radius: 999px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 0.78rem;
+          font-weight: 800;
+          border: 2px solid #64748b;
+          color: #172033;
+          margin-top: 0.1rem;
+        }
+        .chat-avatar-user {
+          background: #bfdbfe;
+          border-color: #2563eb;
+        }
+        .chat-avatar-assistant {
+          background: #bbf7d0;
+          border-color: #16a34a;
+        }
+        .chat-bubble {
+          max-width: 78%;
+          border: 2px solid #94a3b8;
+          border-radius: 10px;
+          padding: 0.65rem 0.8rem;
+          line-height: 1.65;
+          color: var(--ink);
+          overflow-wrap: anywhere;
+          box-shadow: 0 5px 14px rgba(15, 23, 42, 0.07);
+        }
+        .chat-bubble-user {
+          background: #dbeafe;
+          border-color: #2563eb;
+          margin-left: auto;
+          margin-right: 0;
+          border-top-right-radius: 2px;
+        }
+        .chat-bubble-assistant {
+          background: #f0fdf4;
+          border-color: #16a34a;
+          margin-left: 0;
+          margin-right: auto;
+          border-top-left-radius: 2px;
+        }
+        .st-key-chat_history {
+          background: #f8fafc;
+          border: 2px solid #94a3b8;
+          border-radius: 10px;
+          padding: 0.35rem 0.7rem;
+          margin-bottom: 0.75rem;
+        }
+        .st-key-chat_composer {
+          position: sticky;
+          bottom: 0;
+          z-index: 20;
+          background: var(--paper);
+          border-top: 2px solid var(--line);
+          padding-top: 0.65rem;
+          padding-bottom: 0.25rem;
+        }
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stTextArea"] textarea,
+        div[data-testid="stChatInput"] textarea,
+        div[data-testid="stSelectbox"],
+        div[data-testid="stRadio"] {
+          border-color: #64748b;
         }
         </style>
         """,
@@ -302,9 +410,9 @@ def _render_header() -> None:
         <div class="hero-card">
           <div class="hero-title">政策问答、工单与审计演示</div>
           <div class="hero-subtitle">
-            当前页面已切换为通过 HTTP 调用 L2 API。默认自然语言入口统一走 <code>/agent</code>，
-            能展示“一句话问答 / 建单 / 补信息 / 工单操作”的真实后端闭环；仅保留手动建单表单
-            直调 <code>/tickets</code>，便于对比受控编排与原始接口。
+            当前页面通过 HTTP 调用 L2 API。聊天页支持 <code>自动 / 问答 / 工单</code> 三种模式：
+            问答走 <code>/ask/stream</code> 流式输出，工单动作走 <code>/agent</code> 直接返回；
+            手动问答和手动建单页面用于直连调试。
           </div>
         </div>
         """,
@@ -320,7 +428,7 @@ def _ensure_state() -> None:
         "api_base_url": env_base_url,
         "ui_api_key": "",
         "ui_department": "IT",
-        "active_page": "Agent 主页",
+        "active_page": "聊天",
         "auth_access_token": "",
         "auth_user_profile": None,
         "auth_login_identifier": "",
@@ -331,13 +439,16 @@ def _ensure_state() -> None:
         "auth_register_phone": "",
         "clear_auth_login_password_next": False,
         "clear_auth_register_password_next": False,
-        "agent_input": "",
         "ask_input": "",
+        "chat_messages": [],
+        "chat_mode": "自动",
         "last_error": None,
         "last_error_context": None,
         "last_ask": None,
         "last_agent": None,
         "last_manual_ticket": None,
+        "chat_input_text": DEFAULT_CHAT_INPUT_TEXT,
+        "chat_input_seeded_default": DEFAULT_CHAT_INPUT_TEXT,
         "last_ticket_list": [],
         "selected_ticket_id": "",
         "selected_ticket_detail": None,
@@ -374,6 +485,9 @@ def _ensure_state() -> None:
     if current_base_url == "http://localhost:8080" and env_base_url != "http://localhost:8080":
         st.session_state["api_base_url"] = env_base_url
 
+    if str(st.session_state.get("active_page") or "") not in NAVIGATION_PAGES:
+        st.session_state["active_page"] = "聊天"
+
 
 
 def _get_auth_user_profile() -> dict[str, Any] | None:
@@ -405,13 +519,13 @@ def _logout_user() -> None:
     st.session_state["auth_register_password"] = ""
     st.session_state["active_draft_id"] = ""
     st.session_state["active_draft_missing_fields"] = []
-    st.session_state["active_page"] = "Agent 主页"
+    st.session_state["active_page"] = "聊天"
     _clear_error()
     st.rerun()
 
 
 def _render_auth_page(client: PolicyAPIClient) -> None:
-    """渲染登录/注册页；登录成功后进入 Agent 主页。"""
+    """渲染登录/注册页；登录成功后进入聊天页。"""
     st.subheader("登录 / 注册")
     st.caption("请先登录后再进入 Agent、手动问答、工单管理和审计页面。")
     _render_error_card()
@@ -441,7 +555,7 @@ def _render_auth_page(client: PolicyAPIClient) -> None:
                         st.session_state["auth_access_token"] = token
                         st.session_state["auth_user_profile"] = profile
                         st.session_state["clear_auth_login_password_next"] = True
-                        st.session_state["active_page"] = "Agent 主页"
+                        st.session_state["active_page"] = "聊天"
                         client.set_access_token(token)
                         _clear_error()
                         st.toast("登录成功，正在跳转主页。", icon="✅")
@@ -481,7 +595,7 @@ def _render_auth_page(client: PolicyAPIClient) -> None:
                         st.session_state["auth_access_token"] = token
                         st.session_state["auth_user_profile"] = profile
                         st.session_state["clear_auth_register_password_next"] = True
-                        st.session_state["active_page"] = "Agent 主页"
+                        st.session_state["active_page"] = "聊天"
                         client.set_access_token(token)
                         _clear_error()
                         st.toast("注册成功，正在跳转主页。", icon="✅")
@@ -493,7 +607,7 @@ def _render_navigation_sidebar(client: PolicyAPIClient, auth_profile: dict[str, 
     with st.sidebar:
         st.header("导航")
         nav_icons = {
-            "Agent 主页": "🤖 Agent 主页",
+            "聊天": "💬 聊天",
             "手动问答": "💬 手动问答",
             "手动建单": "📝 手动建单",
             "工单管理": "📋 工单管理",
@@ -502,7 +616,7 @@ def _render_navigation_sidebar(client: PolicyAPIClient, auth_profile: dict[str, 
         }
         selected_page = st.radio(
             "选择页面",
-            options=["Agent 主页", "手动问答", "手动建单", "工单管理", "审计追溯", "运行监控"],
+            options=NAVIGATION_PAGES,
             format_func=lambda value: nav_icons.get(value, value),
             key="active_page",
         )
@@ -577,21 +691,6 @@ def _render_error_card() -> None:
 
 
 
-def _render_example_runner() -> str | None:
-    """渲染示例按钮，并返回本轮选中的示例文本。"""
-    st.caption("一键示例：点击后会把文本填入“一句话入口”输入框。")
-    columns = st.columns(len(EXAMPLE_CASES), gap="small")
-    selected_text: str | None = None
-
-    for index, (column, item) in enumerate(zip(columns, EXAMPLE_CASES), start=1):
-        with column:
-            if st.button(item["label"], key=f"example_run_{index}", use_container_width=True):
-                selected_text = str(item["text"])
-
-    return selected_text
-
-
-
 def _render_answer_block(answer_text: str) -> None:
     """渲染答案主体。"""
     safe_text = html.escape(answer_text.strip())
@@ -649,7 +748,7 @@ def _render_hits(hits: list[dict[str, Any]], *, show_header: bool = True) -> Non
 
 
 def _render_kb_response(kb_response: dict[str, Any]) -> None:
-    """渲染 `/ask` 或 `/agent.kb` 返回的问答结果。"""
+    """渲染 `/ask` 返回的问答结果。"""
     if not kb_response:
         return
 
@@ -682,159 +781,6 @@ def _render_kb_response(kb_response: dict[str, Any]) -> None:
             )
         else:
             st.caption("本次响应未携带 request_id，无 Trace 信息。")
-
-
-def _render_action_kb_trace(kb_response: dict[str, Any]) -> None:
-    """渲染动作型 Agent 路由关联的 KB 证据，避免把它误展示成最终答案。"""
-    if not kb_response:
-        return
-
-    meta = kb_response.get("meta", {}) or {}
-    request_id = str(kb_response.get("request_id") or "")
-    citations = kb_response.get("citations", []) or []
-    retrieve_hits = meta.get("retrieve_topk", []) or []
-
-    with st.expander("查看关联知识库证据 / Trace"):
-        st.caption("该信息用于审计追溯和证据关联；动作型请求的最终结果以上方工单状态为准。")
-        metric_left, metric_right = st.columns(2)
-        metric_left.metric("引用条数", len(citations))
-        metric_right.metric("命中证据", len(retrieve_hits))
-
-        citations_tab, hits_tab, trace_tab = st.tabs(["引用", "命中证据", "Trace / Debug"])
-        with citations_tab:
-            _render_citations(citations, show_header=False)
-        with hits_tab:
-            _render_hits(retrieve_hits, show_header=False)
-        with trace_tab:
-            if request_id:
-                st.code(
-                    json.dumps(
-                        {"request_id": request_id, "meta": meta},
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    language="json",
-                )
-            else:
-                st.caption("本次响应未携带 request_id，无 Trace 信息。")
-
-
-
-def _render_agent_response(agent_response: dict[str, Any]) -> None:
-    """根据 `/agent` 的 route 分支渲染不同结果。"""
-    if not agent_response:
-        return
-
-    route = str(agent_response.get("route") or "UNKNOWN")
-    message = str(agent_response.get("message") or "")
-    missing_fields = agent_response.get("missing_fields", []) or []
-    ticket = agent_response.get("ticket") or None
-    ticket_detail = agent_response.get("ticket_detail") or None
-    draft = agent_response.get("draft") or None
-    extraction = agent_response.get("extraction") or None
-    kb_response = agent_response.get("kb") or None
-
-    st.markdown(
-        f"""
-        <div class="route-card">
-          <div class="answer-label">AGENT ROUTE</div>
-          <div style="margin-top:0.15rem;">{_route_badge_html(route)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if route == "CREATE_TICKET" and isinstance(ticket, dict):
-        st.markdown(
-            f"""
-            <div class="ticket-card">
-              <div class="answer-label" style="color:#9a6a00;">TICKET CREATED</div>
-              <div class="answer-text">工单号：{html.escape(str(ticket.get('ticket_id') or ''))}</div>
-              <div style="margin-top:0.45rem;">状态：{_status_badge_html(ticket.get('status'))}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    elif route == "NEED_MORE_INFO":
-        st.warning(message or "当前信息不足，无法直接建单。")
-        if missing_fields:
-            st.info("缺失字段：" + "、".join(str(item) for item in missing_fields))
-        if isinstance(draft, dict):
-            st.info("草稿号：" + str(draft.get("draft_id") or ""))
-            if draft.get("expires_at"):
-                st.caption("草稿有效期至：" + str(draft.get("expires_at")))
-    elif route in ("DRAFT_EXPIRED", "DRAFT_NOT_FOUND"):
-        st.warning(message or "当前草稿不可继续使用，请重新发起。")
-        if isinstance(draft, dict):
-            st.info("草稿号：" + str(draft.get("draft_id") or ""))
-    elif route == "ASK":
-        st.success("当前输入被判定为纯问答请求。")
-    elif route == "LOOKUP_TICKET":
-        st.success(message or "已查询工单进度。")
-    elif route == "ADD_TICKET_COMMENT":
-        st.success(message or "已追加工单说明。")
-    elif route == "ESCALATE_TICKET":
-        st.success(message or "已记录催办。")
-    elif route == "CANCEL_TICKET":
-        st.success(message or "已取消工单。")
-
-    if extraction:
-        with st.expander("查看 Agent 抽取结果"):
-            st.code(json.dumps(extraction, ensure_ascii=False, indent=2), language="json")
-
-    if isinstance(ticket_detail, dict):
-        _render_ticket_detail_card(ticket_detail)
-
-    if isinstance(kb_response, dict):
-        if route == "ASK":
-            _render_kb_response(kb_response)
-        else:
-            _render_action_kb_trace(kb_response)
-
-
-
-def _handle_agent_submit(client: PolicyAPIClient, text: str, user_name: str, department: str) -> None:
-    """执行 `/agent` 调用并保存结果。"""
-    _clear_error()
-    try:
-        result = client.agent(text=text, user=user_name, department=department)
-    except APIClientError as exc:
-        _set_error("调用 /agent", exc)
-        return
-
-    st.session_state["last_agent"] = result
-    st.session_state["last_ask"] = None
-
-    kb_response = result.get("kb") or {}
-    if isinstance(kb_response, dict) and kb_response.get("request_id"):
-        st.session_state["trace_request_id"] = str(kb_response.get("request_id"))
-
-    draft = result.get("draft") or {}
-    if isinstance(draft, dict) and draft.get("draft_id"):
-        st.session_state["active_draft_id"] = str(draft.get("draft_id"))
-        st.session_state["active_draft_missing_fields"] = list(draft.get("missing_fields") or [])
-        st.session_state["draft_followup_location"] = ""
-        st.session_state["draft_followup_contact"] = ""
-        st.session_state["draft_followup_note"] = ""
-        if not st.session_state.get("trace_request_id") and draft.get("kb_request_id"):
-            st.session_state["trace_request_id"] = str(draft.get("kb_request_id"))
-    else:
-        st.session_state["active_draft_id"] = ""
-        st.session_state["active_draft_missing_fields"] = []
-        st.session_state["draft_followup_location"] = ""
-        st.session_state["draft_followup_contact"] = ""
-        st.session_state["draft_followup_note"] = ""
-
-    ticket = result.get("ticket") or {}
-    if isinstance(ticket, dict) and ticket.get("ticket_id"):
-        st.session_state["selected_ticket_id"] = str(ticket.get("ticket_id"))
-        st.session_state["trace_ticket_id"] = str(ticket.get("ticket_id"))
-        st.session_state["active_draft_id"] = ""
-        st.session_state["active_draft_missing_fields"] = []
-        st.session_state["draft_followup_location"] = ""
-        st.session_state["draft_followup_contact"] = ""
-        st.session_state["draft_followup_note"] = ""
-
 
 
 def _handle_ask_submit(client: PolicyAPIClient, question: str, user_name: str, department: str) -> None:
@@ -890,8 +836,8 @@ def _handle_draft_continue_submit(
     if isinstance(updated_draft, dict) and updated_draft.get("draft_id"):
         st.session_state["active_draft_id"] = str(updated_draft.get("draft_id"))
         st.session_state["active_draft_missing_fields"] = list(updated_draft.get("missing_fields") or [])
-        if updated_draft.get("kb_request_id"):
-            st.session_state["trace_request_id"] = str(updated_draft.get("kb_request_id"))
+        if updated_draft.get("agent_request_id"):
+            st.session_state["trace_request_id"] = str(updated_draft.get("agent_request_id"))
     else:
         st.session_state["active_draft_id"] = ""
         st.session_state["active_draft_missing_fields"] = []
@@ -1032,15 +978,20 @@ def _load_trace_bundle(
             ticket_detail = client.get_ticket(normalized_ticket_id)
             context = ticket_detail.get("context") or {}
             if not resolved_request_id and isinstance(context, dict):
-                kb_request_id = context.get("kb_request_id")
-                if kb_request_id:
-                    resolved_request_id = str(kb_request_id)
+                agent_request_id = context.get("agent_request_id")
+                if agent_request_id:
+                    resolved_request_id = str(agent_request_id)
 
             audit_logs.extend(client.list_audit_logs(ticket_id=normalized_ticket_id, limit=100))
 
         kb_detail: dict[str, Any] | None = None
         if resolved_request_id:
-            kb_detail = client.get_kb_query(resolved_request_id)
+            try:
+                kb_detail = client.get_kb_query(resolved_request_id)
+            except APIClientError as exc:
+                if exc.status_code != 404:
+                    raise
+                kb_detail = None
             audit_logs.extend(client.list_audit_logs(request_id=resolved_request_id, limit=100))
         else:
             kb_detail = None
@@ -1332,9 +1283,9 @@ def _render_trace_explorer(client: PolicyAPIClient) -> None:
         st.markdown("#### 关联工单")
         _render_ticket_detail_card(trace_ticket)
         ticket_context = trace_ticket.get("context") or {}
-        if isinstance(ticket_context, dict) and ticket_context.get("kb_request_id"):
+        if isinstance(ticket_context, dict) and ticket_context.get("agent_request_id"):
             with st.expander("查看内部链路 ID"):
-                st.code(str(ticket_context.get("kb_request_id")), language="text")
+                st.code(str(ticket_context.get("agent_request_id")), language="text")
 
     trace_kb = st.session_state.get("trace_kb_detail")
     if isinstance(trace_kb, dict):
@@ -1354,52 +1305,300 @@ def _render_trace_explorer(client: PolicyAPIClient) -> None:
     _render_audit_timeline(st.session_state.get("trace_audit_logs") or [])
 
 
-def _render_agent_home_page(
+def _partial_answer_from_json_stream(raw_text: str) -> str:
+    """从流式 JSON 片段里尽量提取 answer 字段的已生成部分。"""
+    marker_index = raw_text.find('"answer"')
+    if marker_index < 0:
+        return ""
+    colon_index = raw_text.find(":", marker_index)
+    if colon_index < 0:
+        return ""
+    quote_index = raw_text.find('"', colon_index)
+    if quote_index < 0:
+        return ""
+
+    chars: list[str] = []
+    escaped = False
+    index = quote_index + 1
+    while index < len(raw_text):
+        char = raw_text[index]
+        if escaped:
+            if char == "n":
+                chars.append("\n")
+            elif char == "t":
+                chars.append("\t")
+            elif char in {'"', "\\", "/"}:
+                chars.append(char)
+            else:
+                chars.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            break
+        else:
+            chars.append(char)
+        index += 1
+    return "".join(chars).strip()
+
+
+def _chat_should_use_agent(text: str) -> bool:
+    """自动模式下判断是否走工单 Agent。"""
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    if str(st.session_state.get("active_draft_id") or "").strip():
+        return True
+    ticket_markers = (
+        "工单",
+        "报修",
+        "维修",
+        "建单",
+        "提交",
+        "处理一下",
+        "帮我看下",
+        "查一下",
+        "进度",
+        "状态",
+        "补充",
+        "备注",
+        "留言",
+        "催办",
+        "催一下",
+        "加急",
+        "提醒负责处理",
+        "取消",
+        "撤销",
+        "关闭",
+    )
+    if "TCK-" in normalized or "DRF-" in normalized:
+        return True
+    return any(marker in normalized for marker in ticket_markers)
+
+
+def _chat_execution_path(mode: str, text: str) -> str:
+    """返回聊天输入应走的执行路径：ASK 流式或 Agent 直接结果。"""
+    selected_mode = str(mode or "自动")
+    if selected_mode == "问答":
+        return "ask_stream"
+    if selected_mode == "工单":
+        return "agent"
+    if _chat_should_use_agent(text):
+        return "agent"
+    return "ask_stream"
+
+
+def _apply_chat_agent_side_effects(result: dict[str, Any]) -> None:
+    """把 Agent 响应同步到现有草稿、工单与追溯状态。"""
+    draft = result.get("draft") or {}
+    if isinstance(draft, dict) and draft.get("draft_id") and str(draft.get("status") or "") == "open":
+        st.session_state["active_draft_id"] = str(draft.get("draft_id"))
+        st.session_state["active_draft_missing_fields"] = list(draft.get("missing_fields") or [])
+        if draft.get("agent_request_id"):
+            st.session_state["trace_request_id"] = str(draft.get("agent_request_id"))
+    else:
+        st.session_state["active_draft_id"] = ""
+        st.session_state["active_draft_missing_fields"] = []
+
+    ticket = result.get("ticket") or {}
+    if isinstance(ticket, dict) and ticket.get("ticket_id"):
+        ticket_id = str(ticket.get("ticket_id"))
+        st.session_state["selected_ticket_id"] = ticket_id
+        st.session_state["trace_ticket_id"] = ticket_id
+
+
+def _agent_response_to_chat_text(result: dict[str, Any]) -> str:
+    """把 Agent 结构化响应整理成聊天气泡文本。"""
+    route = str(result.get("route") or "UNKNOWN")
+    message = str(result.get("message") or "").strip()
+    ticket = result.get("ticket") or {}
+    draft = result.get("draft") or {}
+    missing_fields = list(result.get("missing_fields") or [])
+    confirm_token = str(result.get("confirm_token") or "").strip()
+
+    if route == "CREATE_TICKET" and isinstance(ticket, dict):
+        ticket_id = str(ticket.get("ticket_id") or "")
+        status = str(ticket.get("status") or "")
+        return message or f"已创建工单 {ticket_id}，当前状态：{status}。"
+    if route == "NEED_MORE_INFO" and isinstance(draft, dict):
+        draft_id = str(draft.get("draft_id") or "")
+        fields_text = "、".join(missing_fields) if missing_fields else "必要字段"
+        return message or f"还缺少 {fields_text}。草稿 {draft_id} 已保存。"
+    if route == "NEED_CONFIRMATION" and confirm_token:
+        return message or "这是高风险操作，请确认后再执行。"
+    if route in {"LOOKUP_TICKET", "ADD_TICKET_COMMENT", "ESCALATE_TICKET", "CANCEL_TICKET"}:
+        return message or "工单操作已完成。"
+    if result.get("kb"):
+        kb = result.get("kb") or {}
+        return str(kb.get("answer") or message or "已完成问答。")
+    return message or f"已完成处理：{route}"
+
+
+def _chat_bubble_html(role: str, content: str) -> str:
+    """生成左右对齐的聊天气泡 HTML。"""
+    normalized_role = "user" if str(role or "") == "user" else "assistant"
+    safe_content = html.escape(str(content or "")).replace("\n", "<br>")
+    avatar_text = "我" if normalized_role == "user" else "AI"
+    avatar = f'<div class="chat-avatar chat-avatar-{normalized_role}">{avatar_text}</div>'
+    bubble = f'<div class="chat-bubble chat-bubble-{normalized_role}">{safe_content}</div>'
+    if normalized_role == "user":
+        content_html = f"{bubble}{avatar}"
+    else:
+        content_html = f"{avatar}{bubble}"
+    return f'<div class="chat-row chat-row-{normalized_role}">{content_html}</div>'
+
+
+def _render_chat_bubble(role: str, content: str) -> None:
+    """渲染一个聊天气泡。"""
+    st.markdown(_chat_bubble_html(role, content), unsafe_allow_html=True)
+
+
+def _default_chat_input_for_mode(mode: str) -> str:
+    """返回当前聊天模式对应的默认输入。"""
+    return DEFAULT_CHAT_INPUT_BY_MODE.get(str(mode or "自动"), DEFAULT_CHAT_INPUT_TEXT)
+
+
+def _seed_default_chat_input(mode: str) -> None:
+    """在聊天输入框创建前写入模式默认问题，同时不覆盖用户自己输入的内容。"""
+    target_default = _default_chat_input_for_mode(mode)
+    current_text = str(st.session_state.get("chat_input_text") or "").strip()
+    seeded_default = str(st.session_state.get("chat_input_seeded_default") or "").strip()
+    known_defaults = set(DEFAULT_CHAT_INPUT_BY_MODE.values()) | OLD_CHAT_INPUT_DEFAULTS
+    should_seed = (
+        not current_text
+        or current_text in known_defaults
+        or (current_text == seeded_default and current_text != target_default)
+    )
+    if should_seed:
+        st.session_state["chat_input_text"] = target_default
+        st.session_state["chat_input_seeded_default"] = target_default
+
+
+def _render_chat_page(
     client: PolicyAPIClient,
     user_name: str,
     department: str,
     is_authenticated: bool,
 ) -> None:
-    """渲染 Agent 主页。"""
+    """渲染统一聊天页：问答走 ASK stream，工单走 Agent。"""
     _render_error_card()
-    example_text = _render_example_runner()
-    if example_text:
-        st.session_state["agent_input"] = example_text
+    st.subheader("聊天")
+    if str(st.session_state.get("chat_mode") or "") not in CHAT_MODE_OPTIONS:
+        st.session_state["chat_mode"] = "自动"
 
-    st.subheader("Agent 主页")
-    agent_text = st.text_area(
-        "输入一句话描述",
-        height=130,
-        placeholder="例如：我的办公电脑无法连接公司内网，帮我提交 IT 工单。地点北京总部 12 层工位 A1208，联系方式 138xxxx。",
-        key="agent_input",
-    )
+    left, right = st.columns([2, 1])
+    with left:
+        mode = st.radio(
+            "模式",
+            options=CHAT_MODE_OPTIONS,
+            key="chat_mode",
+            horizontal=True,
+            disabled=not is_authenticated,
+        )
+    with right:
+        if st.button("清空对话", use_container_width=True):
+            target_default = _default_chat_input_for_mode(str(mode or "自动"))
+            st.session_state["chat_messages"] = []
+            st.session_state["active_draft_id"] = ""
+            st.session_state["active_draft_missing_fields"] = []
+            st.session_state["chat_input_text"] = target_default
+            st.session_state["chat_input_seeded_default"] = target_default
+            st.rerun()
 
-    run_agent = st.button(
-        "调用 /agent",
-        type="primary",
-        use_container_width=True,
-        disabled=not is_authenticated,
-        key="run_agent_home",
-    )
-    if run_agent:
-        text = agent_text.strip()
-        if not text:
-            st.warning("请先输入一句话描述。")
+    messages = st.session_state.get("chat_messages")
+    if not isinstance(messages, list):
+        messages = []
+        st.session_state["chat_messages"] = messages
+
+    chat_history = st.container(height=460, border=False, key="chat_history")
+    with chat_history:
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "assistant")
+            _render_chat_bubble(role, str(message.get("content") or ""))
+            response = message.get("response")
+            if isinstance(response, dict):
+                if response.get("kb"):
+                    _render_citations((response.get("kb") or {}).get("citations") or [])
+                elif response.get("ticket_detail"):
+                    _render_ticket_detail_card(response.get("ticket_detail") or {})
+
+    _seed_default_chat_input(str(mode or "自动"))
+
+    with st.container(key="chat_composer"):
+        prompt = st.text_area(
+            "输入问题或工单需求",
+            key="chat_input_text",
+            height=86,
+            disabled=not is_authenticated,
+        )
+        send_clicked = st.button(
+            "发送",
+            type="primary",
+            use_container_width=True,
+            disabled=not is_authenticated,
+            key="send_chat_message",
+        )
+    if not send_clicked:
+        return
+
+    user_text = prompt.strip()
+    if not user_text:
+        return
+
+    messages.append({"role": "user", "content": user_text})
+    with chat_history:
+        _render_chat_bubble("user", user_text)
+
+    execution_path = _chat_execution_path(str(mode or "自动"), user_text)
+
+    try:
+        if execution_path == "agent":
+            result = client.agent(
+                text=user_text,
+                user=user_name,
+                department=department,
+                draft_id=str(st.session_state.get("active_draft_id") or "") or None,
+            )
+            _apply_chat_agent_side_effects(result)
+            content = _agent_response_to_chat_text(result)
+            with chat_history:
+                _render_chat_bubble("assistant", content)
+            messages.append({"role": "assistant", "content": content, "response": result})
         else:
-            with st.spinner("正在调用 /agent ..."):
-                _handle_agent_submit(client, text, user_name, department)
+            with chat_history:
+                placeholder = st.empty()
+            raw_stream = ""
+            final_response: dict[str, Any] | None = None
+            placeholder.markdown(_chat_bubble_html("assistant", "正在生成回答..."), unsafe_allow_html=True)
+            for event in client.ask_stream_events(user_text, user=user_name, department=department):
+                event_name = str(event.get("event") or "")
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if event_name in {"token", "reasoning_token"}:
+                    raw_stream += str(data.get("delta") or "")
+                    preview = _partial_answer_from_json_stream(raw_stream)
+                    if preview:
+                        placeholder.markdown(_chat_bubble_html("assistant", preview), unsafe_allow_html=True)
+                elif event_name == "final":
+                    final_response = data
+                elif event_name == "error":
+                    raise APIClientError(message=str(data.get("message") or "流式问答失败。"))
 
-    agent_response = st.session_state.get("last_agent")
-    if isinstance(agent_response, dict):
-        if str(agent_response.get("route") or "") == "ASK":
-            st.subheader("问答结果（经 /agent 路由）")
-        else:
-            st.subheader("一句话结果（/agent）")
-        _render_agent_response(agent_response)
-    else:
-        st.info("提交一句话后，这里会展示 /agent 返回结果。")
-
-    _render_draft_continue_form(client, user_name, department, is_authenticated=is_authenticated)
+            answer = str((final_response or {}).get("answer") or "").strip()
+            if not answer:
+                answer = _partial_answer_from_json_stream(raw_stream) or "未生成有效回答。"
+            placeholder.markdown(_chat_bubble_html("assistant", answer), unsafe_allow_html=True)
+            if isinstance(final_response, dict):
+                with chat_history:
+                    _render_citations(final_response.get("citations") or [])
+            messages.append({"role": "assistant", "content": answer, "response": {"kb": final_response}})
+    except APIClientError as exc:
+        _set_error("聊天调用", exc)
+        error_text = exc.message
+        with chat_history:
+            _render_chat_bubble("assistant", error_text)
+        messages.append({"role": "assistant", "content": error_text})
 
 
 def _render_manual_qa_page(
@@ -1637,8 +1836,8 @@ def main() -> None:
         user_name = str(auth_user.get("username") or "anonymous")
     department = str(auth_user.get("department") or st.session_state.get("ui_department") or "IT")
 
-    if selected_page == "Agent 主页":
-        _render_agent_home_page(client, user_name, department, is_authenticated=is_authenticated)
+    if selected_page == "聊天":
+        _render_chat_page(client, user_name, department, is_authenticated=is_authenticated)
     elif selected_page == "手动问答":
         _render_manual_qa_page(client, user_name, department, is_authenticated=is_authenticated)
     elif selected_page == "手动建单":

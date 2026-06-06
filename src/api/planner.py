@@ -721,7 +721,7 @@ def build_ticket_subplanner_prompt(
         "你必须直接使用提供的 ticket_id，禁止改写、猜测或编造新的 ticket_id。"
         "动作选择必须按以下优先级："
         "1) 若命中取消关键词【取消、撤销、关闭工单】=> cancel_ticket；"
-        "2) 否则若命中催办关键词【催办、催一下、加急、升级】=> escalate_ticket；"
+        "2) 否则若命中催办关键词【催办、催一下、加急、升级、提醒负责处理人、提醒负责处理的同事、尽快安排、推动一下】=> escalate_ticket；"
         "3) 否则若命中补充关键词【补充、补充说明、追加、备注、留言】=> add_ticket_comment；"
         "4) 否则若命中查询关键词【查工单、查一下、查询、进度、状态】=> lookup_ticket；"
         "5) 否则默认 lookup_ticket。"

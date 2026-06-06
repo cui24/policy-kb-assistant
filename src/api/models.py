@@ -238,7 +238,7 @@ class TicketDraft(Base):
     missing_fields_json: Mapped[list] = mapped_column(JsonType, default=list)
     status: Mapped[str] = mapped_column(String(32), default="open", index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    kb_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    agent_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class AgentConversationMemory(Base):

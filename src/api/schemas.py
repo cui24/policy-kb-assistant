@@ -171,7 +171,7 @@ class TicketDraftResponse(BaseModel):
     missing_fields: list[str] = Field(default_factory=list)
     expires_at: str
     payload: dict[str, Any]
-    kb_request_id: str | None = None
+    agent_request_id: str | None = None
 
 
 ToolName = Literal[

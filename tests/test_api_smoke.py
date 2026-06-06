@@ -27,8 +27,37 @@ from sqlalchemy.pool import StaticPool
 import src.api.app as api_app_module
 from src.api.schemas import ToolPlan
 from src.api.db import Base
-from src.api.deps import get_db
+from src.api.deps import get_db, get_redis_dep
 from src.api import crud, models, services
+
+
+class _FakeRedis:
+    """测试用最小 Redis 替身，覆盖限流与幂等需要的方法。"""
+
+    def __init__(self) -> None:
+        self._store: dict[str, object] = {}
+
+    def incr(self, key: str) -> int:
+        current = int(self._store.get(key, 0) or 0) + 1
+        self._store[key] = current
+        return current
+
+    def expire(self, key: str, seconds: int) -> bool:
+        return True
+
+    def set(self, key: str, value: object, ex: int | None = None, nx: bool = False) -> bool:
+        if nx and key in self._store:
+            return False
+        self._store[key] = value
+        return True
+
+    def get(self, key: str) -> object | None:
+        return self._store.get(key)
+
+    def delete(self, key: str) -> int:
+        existed = key in self._store
+        self._store.pop(key, None)
+        return 1 if existed else 0
 
 
 def _build_test_session() -> Session:
@@ -42,6 +71,11 @@ def _build_test_session() -> Session:
     Base.metadata.create_all(bind=engine)
     local_session = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
     return local_session()
+
+
+def _override_redis_dependency() -> None:
+    fake_redis = _FakeRedis()
+    api_app_module.app.dependency_overrides[get_redis_dep] = lambda: fake_redis
 
 
 
@@ -125,6 +159,7 @@ def test_ticket_api_requires_key_and_keeps_read_open(monkeypatch) -> None:
 
     monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
     api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    _override_redis_dependency()
 
     try:
         with TestClient(api_app_module.app) as client:
@@ -270,7 +305,7 @@ def test_ops_metrics_summarizes_recent_kb_queries(monkeypatch) -> None:
             missing_fields_json=[],
             status="consumed",
             expires_at=now + timedelta(minutes=20),
-            kb_request_id=None,
+            agent_request_id=None,
         )
     )
     db.add(
@@ -319,6 +354,7 @@ def test_ops_metrics_summarizes_recent_kb_queries(monkeypatch) -> None:
 
     monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
     api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    _override_redis_dependency()
 
     try:
         with TestClient(api_app_module.app) as client:
@@ -373,6 +409,7 @@ def test_agent_api_supports_idempotent_draft_resume(monkeypatch) -> None:
 
     _patch_agent_dependencies(monkeypatch)
     api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    _override_redis_dependency()
 
     try:
         with TestClient(api_app_module.app) as client:
@@ -450,6 +487,7 @@ def test_agent_api_hides_forbidden_draft_as_not_found(monkeypatch) -> None:
 
     _patch_agent_dependencies(monkeypatch)
     api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    _override_redis_dependency()
 
     try:
         with TestClient(api_app_module.app) as client:
@@ -500,6 +538,7 @@ def test_ticket_tool_endpoints_and_agent_lookup(monkeypatch) -> None:
 
     monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
     api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    _override_redis_dependency()
 
     try:
         with TestClient(api_app_module.app) as client:
@@ -609,6 +648,7 @@ def test_agent_api_llm_cancel_requires_confirmation_then_confirms(monkeypatch) -
         ),
     )
     api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    _override_redis_dependency()
 
     try:
         with TestClient(api_app_module.app) as client:

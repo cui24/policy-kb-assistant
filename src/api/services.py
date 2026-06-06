@@ -78,7 +78,16 @@ _OPTIONAL_ACTION_KEYWORDS = ("申请", "开通")
 _OPTIONAL_ACTION_DOMAINS = ("网络", "账号", "权限", "校园网", "认证")
 _TICKET_LOOKUP_KEYWORDS = ("查工单", "查一下", "查询", "进度", "状态")
 _TICKET_COMMENT_KEYWORDS = ("补充", "补充说明", "追加", "备注", "留言")
-_TICKET_ESCALATE_KEYWORDS = ("催办", "催一下", "加急", "升级")
+_TICKET_ESCALATE_KEYWORDS = (
+    "催办",
+    "催一下",
+    "加急",
+    "升级",
+    "提醒负责处理人",
+    "提醒负责处理的同事",
+    "尽快安排",
+    "推动一下",
+)
 _TICKET_CANCEL_KEYWORDS = ("取消", "撤销", "关闭工单")
 _DRAFT_REQUIRED_FIELDS = ("location", "contact")
 _DRAFT_ALLOWED_FIELDS = (
@@ -91,7 +100,6 @@ _DRAFT_ALLOWED_FIELDS = (
     "contact",
     "location",
     "source_text",
-    "kb_attempt_stage",
 )
 _TICKET_PUBLIC_ID_RE = re.compile(r"TCK-\d{4}-[A-Z0-9]+")
 _TICKET_COMMENT_FETCH_LIMIT = 20
@@ -313,7 +321,6 @@ def _build_ticket_payload(
     actor: str,
     actor_department: str,
     source_text: str,
-    kb_attempt_stage: str | None = None,
 ) -> dict:
     """把一次新请求的抽取结果整理成完整草稿载荷。"""
     partial = _normalize_partial_fields(source_fields)
@@ -328,7 +335,6 @@ def _build_ticket_payload(
         "contact": partial.get("contact"),
         "location": partial.get("location"),
         "source_text": partial.get("source_text") or text_value,
-        "kb_attempt_stage": partial.get("kb_attempt_stage") or kb_attempt_stage,
     }
     return payload
 
@@ -955,7 +961,7 @@ def serialize_ticket_draft(draft) -> dict:
         "missing_fields": list(draft.missing_fields_json or []),
         "expires_at": draft.expires_at.isoformat(),
         "payload": draft.payload_json or {},
-        "kb_request_id": draft.kb_request_id,
+        "agent_request_id": draft.agent_request_id,
     }
 
 
@@ -1780,7 +1786,6 @@ def _build_need_more_info_response(
     message: str,
     missing_fields: list[str],
     draft=None,
-    kb_result: dict | None = None,
     extraction_payload: dict | None = None,
     extractor: str = "draft_merge",
     memory_applied: dict | None = None,
@@ -1792,7 +1797,6 @@ def _build_need_more_info_response(
         "missing_fields": list(missing_fields),
         "memory_applied": memory_applied,
         "draft": serialize_ticket_draft(draft) if draft is not None else None,
-        "kb": public_kb_response(kb_result) if isinstance(kb_result, dict) else None,
         "extraction": _build_extraction_view(extraction_payload, missing_fields, extractor)
         if extraction_payload is not None
         else None,
@@ -1823,7 +1827,7 @@ def _create_draft_for_missing_info(
             "missing_fields_json": list(missing_fields),
             "status": "open",
             "expires_at": _draft_expiry(),
-            "kb_request_id": chain_request_id,
+            "agent_request_id": chain_request_id,
         },
     )
 
@@ -1903,7 +1907,7 @@ def _resume_ticket_draft_workflow(
         )
         raise LookupError("draft_not_found")
 
-    chain_request_id = str(draft.kb_request_id or _new_request_id())
+    chain_request_id = str(draft.agent_request_id or _new_request_id())
     draft_owner_user_id = str(draft.owner_user_id or "").strip()
     can_manage_draft = (
         _is_admin_like(actor_role, actor)
@@ -2029,7 +2033,7 @@ def _resume_ticket_draft_workflow(
 
     merged_payload.setdefault("creator", draft.creator or actor)
     merged_payload.setdefault("department", draft.department or actor_department)
-    if draft.kb_request_id and not merged_payload.get("source_text"):
+    if draft.agent_request_id and not merged_payload.get("source_text"):
         existing_payload = draft.payload_json if isinstance(draft.payload_json, dict) else {}
         merged_payload["source_text"] = str(existing_payload.get("source_text") or "")
 
@@ -2093,8 +2097,7 @@ def _resume_ticket_draft_workflow(
             contact=merged_payload.get("contact"),
             source_draft_id=draft.draft_id,
             context_json={
-                "kb_request_id": draft.kb_request_id,
-                "kb_attempt_stage": merged_payload.get("kb_attempt_stage"),
+                "agent_request_id": draft.agent_request_id,
                 "location": merged_payload.get("location"),
                 "source_text": merged_payload.get("source_text"),
                 "draft_id": draft.draft_id,
@@ -2176,7 +2179,7 @@ def _resume_ticket_draft_workflow(
         if existing_ticket is None or recovered_draft is None:
             raise
 
-        chain_request_id = str(recovered_draft.kb_request_id or _new_request_id())
+        chain_request_id = str(recovered_draft.agent_request_id or _new_request_id())
         crud.create_audit_log(
             db,
             {
@@ -2262,15 +2265,9 @@ def _handle_create_ticket_intent(
     actor_department: str,
     planner_fields: dict | None = None,
 ) -> dict:
-    """按既有建单链路处理：先问答，再抽取，再建单或进入草稿。"""
+    """按工单链路处理：抽取字段后建单或进入草稿，不再执行知识问答。"""
     resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
-    kb_result = run_ask_workflow(
-        db,
-        text,
-        actor,
-        actor_department,
-        actor_user_id=resolved_actor_user_id,
-    )
+    chain_request_id = _new_request_id()
     extracted = extract_ticket_payload(text, actor, actor_department)
     if isinstance(planner_fields, dict):
         extracted = _merge_draft_payload(extracted, planner_fields)
@@ -2281,12 +2278,10 @@ def _handle_create_ticket_intent(
         actor=actor,
         actor_department=actor_department,
         source_text=text,
-        kb_attempt_stage=str(kb_result["meta"].get("attempt_stage") or "unknown"),
     )
     payload, memory_applied = _apply_user_memory_defaults(payload, user_memory_snapshot)
     memory_applied_payload = _build_memory_applied_payload(payload, memory_applied)
     missing_fields = _compute_missing_fields(payload)
-    chain_request_id = str(kb_result["request_id"])
 
     if missing_fields:
         draft_response = _create_draft_for_missing_info(
@@ -2323,7 +2318,6 @@ def _handle_create_ticket_intent(
                 },
             },
         )
-        draft_response["kb"] = public_kb_response(kb_result)
         return draft_response
 
     ticket = create_ticket_workflow(
@@ -2336,8 +2330,7 @@ def _handle_create_ticket_intent(
         description=str(payload.get("description") or text or "用户未提供详细描述。"),
         contact=payload.get("contact"),
         context={
-            "kb_request_id": kb_result["request_id"],
-            "kb_attempt_stage": kb_result["meta"].get("attempt_stage"),
+            "agent_request_id": chain_request_id,
             "location": payload.get("location"),
             "source_text": payload.get("source_text"),
         },
@@ -2359,7 +2352,6 @@ def _handle_create_ticket_intent(
                 "route": "CREATE_TICKET",
                 "text": text,
                 "extraction": extracted,
-                "kb_request_id": kb_result["request_id"],
                 "planner_fields_applied": bool(isinstance(planner_fields, dict) and planner_fields),
                 "user_memory_applied": {key: value for key, value in memory_applied.items() if value},
             },
@@ -2371,7 +2363,6 @@ def _handle_create_ticket_intent(
         "message": _append_memory_applied_notice("", memory_applied_payload) if memory_applied_payload else None,
         "memory_applied": memory_applied_payload,
         "ticket": {"ticket_id": ticket["ticket_id"], "status": ticket["status"]},
-        "kb": public_kb_response(kb_result),
         "extraction": _build_extraction_view(payload, [], "initial_extract"),
     }
 
@@ -3403,8 +3394,7 @@ def run_agent_workflow(
     actor = user or "anonymous"
     resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
     actor_department = department or "general"
-    """只去除两端空白格符"""
-    normalized_text = (text or "").strip() #
+    normalized_text = (text or "").strip()
     memory_snapshot = _load_short_term_memory(db, resolved_actor_user_id)
     explicit_ticket_id = _extract_ticket_public_id(normalized_text)
     effective_draft_id = str(draft_id or "").strip() or _infer_draft_id_from_memory(

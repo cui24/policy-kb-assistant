@@ -69,3 +69,4 @@ train.py
 # Large or generated local datasets
 data/raw/
 data/extracted/
+data_raw.tar.gz

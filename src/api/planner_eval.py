@@ -13,6 +13,7 @@ import argparse
 from contextlib import contextmanager
 import json
 import os
+from pathlib import Path
 import re
 from typing import Any, Literal
 
@@ -240,6 +241,45 @@ def _patched_eval_agent_dependencies():
 
 
 @contextmanager
+def _patched_eval_ablation(ablation: str):
+    """按需临时回退部分优化，用于复现实验前后对比。"""
+    normalized_ablation = str(ablation or "none").strip().lower()
+    if normalized_ablation in {"", "none"}:
+        yield
+        return
+    if normalized_ablation != "pre_weak_escalate_fix":
+        raise ValueError(f"unsupported ablation: {ablation}")
+
+    original_escalate_keywords = services._TICKET_ESCALATE_KEYWORDS
+    original_build_ticket_subplanner_prompt = planner.build_ticket_subplanner_prompt
+    old_escalate_keywords = ("催办", "催一下", "加急", "升级")
+
+    def _old_build_ticket_subplanner_prompt(
+        user_text: str,
+        provided_ticket_id: str,
+        tools_json: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        system_prompt, user_prompt = original_build_ticket_subplanner_prompt(
+            user_text=user_text,
+            provided_ticket_id=provided_ticket_id,
+            tools_json=tools_json,
+        )
+        system_prompt = system_prompt.replace(
+            "、提醒负责处理人、提醒负责处理的同事、尽快安排、推动一下",
+            "",
+        )
+        return system_prompt, user_prompt
+
+    services._TICKET_ESCALATE_KEYWORDS = old_escalate_keywords  # type: ignore[assignment]
+    planner.build_ticket_subplanner_prompt = _old_build_ticket_subplanner_prompt  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        services._TICKET_ESCALATE_KEYWORDS = original_escalate_keywords  # type: ignore[assignment]
+        planner.build_ticket_subplanner_prompt = original_build_ticket_subplanner_prompt  # type: ignore[assignment]
+
+
+@contextmanager
 def _temporary_agent_planner_mode(mode: EvalStrategy):
     """在评测期间临时切换 Agent Planner 模式。"""
     previous_value = os.environ.get("AGENT_PLANNER_MODE")
@@ -298,7 +338,7 @@ def _seed_eval_draft(db: Session, draft_id: str, actor: str, department: str) ->
             "missing_fields_json": ["location", "contact"],
             "status": "open",
             "expires_at": services._draft_expiry(),
-            "kb_request_id": "eval_draft_chain",
+            "agent_request_id": "eval_draft_chain",
         },
     )
 
@@ -385,6 +425,7 @@ def _workflow_route_matches_case(
 def evaluate_agent_workflow_cases(
     cases: list[dict[str, Any]],
     strategy: EvalStrategy = "hybrid",
+    ablation: str = "none",
 ) -> dict[str, Any]:
     """批量评测 `run_agent_workflow(...)` 的最终用户态效果。"""
     rows: list[dict[str, Any]] = []
@@ -393,7 +434,7 @@ def evaluate_agent_workflow_cases(
     clarification_match_count = 0
     error_count = 0
 
-    with _temporary_agent_planner_mode(strategy), _patched_eval_agent_dependencies():
+    with _temporary_agent_planner_mode(strategy), _patched_eval_ablation(ablation), _patched_eval_agent_dependencies():
         for index, case in enumerate(cases, start=1):
             utterance = str(case.get("utterance") or "")
             context = build_eval_context(case)
@@ -457,6 +498,7 @@ def evaluate_agent_workflow_cases(
         "summary": {
             "evaluation_level": "workflow",
             "strategy": strategy,
+            "ablation": str(ablation or "none"),
             "total_cases": total_cases,
             "executed_case_count": executed_case_count,
             "route_match_count": route_match_count,
@@ -640,6 +682,27 @@ def _print_text_report(report: dict[str, Any], show_mismatches: int = 10) -> Non
         print(json.dumps(payload, ensure_ascii=False))
 
 
+def _load_cases_from_path(path: str) -> list[dict[str, Any]]:
+    """读取外部 JSONL case 文件。"""
+    case_path = Path(path)
+    if not case_path.exists():
+        raise FileNotFoundError(f"cases file not found: {path}")
+
+    cases: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(case_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_number}: invalid JSONL: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"{path}:{line_number}: case must be a JSON object")
+        cases.append(payload)
+    return cases
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口。"""
     parser = argparse.ArgumentParser(description="Evaluate Global Planner on local regression cases.")
@@ -679,9 +742,21 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="Only evaluate the first N cases. Default: 0 (all cases).",
     )
+    parser.add_argument(
+        "--cases",
+        type=str,
+        default="",
+        help="Optional JSONL case file. Default: data/agent/global_planner_regression_cases.jsonl.",
+    )
+    parser.add_argument(
+        "--ablation",
+        choices=("none", "pre_weak_escalate_fix"),
+        default="none",
+        help="Optional workflow ablation for before/after comparisons.",
+    )
     args = parser.parse_args(argv)
 
-    cases = planner.load_global_planner_regression_cases()
+    cases = _load_cases_from_path(args.cases) if args.cases else planner.load_global_planner_regression_cases()
     if not cases:
         print("No regression cases found.")
         return 1
@@ -691,8 +766,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.level == "planner":
         report = evaluate_global_planner_cases(cases, strategy=args.strategy)
     else:
-        report = evaluate_agent_workflow_cases(cases, strategy=args.strategy)
+        report = evaluate_agent_workflow_cases(cases, strategy=args.strategy, ablation=args.ablation)
     if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as handle:
             json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
 
