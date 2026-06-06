@@ -86,7 +86,6 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 try:
     from rank_bm25 import BM25Okapi
@@ -101,7 +100,7 @@ def load_level_config(level: str) -> dict[str, Any]:
 
 
 @lru_cache(maxsize=4)
-def _get_embedding_model(model_name: str) -> SentenceTransformer:
+def _get_embedding_model(model_name: str) -> Any:
     """按模型名缓存 embedding 模型，避免同一进程里重复加载。"""
     """
     L1 回归会在一个 Python 进程里连续执行多次检索。
@@ -109,12 +108,16 @@ def _get_embedding_model(model_name: str) -> SentenceTransformer:
     导致 24 题评测耗时被放大很多倍。
     这里使用进程内缓存，保证同一个模型名在单次运行里只加载一次。
     """
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(model_name)
 
 
 @lru_cache(maxsize=2)
-def _get_rerank_model(model_name: str) -> CrossEncoder:
+def _get_rerank_model(model_name: str) -> Any:
     """按模型名缓存 CrossEncoder reranker，避免每次检索重复加载模型。"""
+    from sentence_transformers import CrossEncoder
+
     return CrossEncoder(model_name)
 
 

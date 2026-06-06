@@ -25,7 +25,7 @@ jobs:
           } >> .env
 
       - name: Build and start Docker services
-        run: docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+        run: docker compose -f compose.yaml -f compose.dev.yaml up -d --build api postgres redis qdrant kb-init
 
       - name: Run deterministic tests
         run: make ci-test
