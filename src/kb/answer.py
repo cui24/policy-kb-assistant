@@ -148,12 +148,16 @@ import json
 import math
 import os
 import re
+import threading
+import time
 from collections.abc import AsyncIterator, Generator
 from typing import Any
 
 import yaml
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAI
+
+from src.api import redis_client
 
 
 _QUERY_SPLIT_MARKERS = (
@@ -203,6 +207,139 @@ _GENERIC_OVERLAP_TERMS = {
     "如何",
     "什么",
 }
+
+_LLM_CIRCUIT_LOCK = threading.Lock()
+_LLM_CIRCUIT_FAILURES = 0
+_LLM_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _float_env(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = str(os.getenv(name) or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def reset_llm_circuit_breaker() -> None:
+    """重置 LLM 熔断状态，主要供测试或人工恢复使用。"""
+    global _LLM_CIRCUIT_FAILURES, _LLM_CIRCUIT_OPEN_UNTIL
+    with _LLM_CIRCUIT_LOCK:
+        _LLM_CIRCUIT_FAILURES = 0
+        _LLM_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _llm_circuit_enabled() -> bool:
+    return _bool_env("OPENAI_CIRCUIT_BREAKER_ENABLED", True)
+
+
+def _llm_failure_threshold() -> int:
+    return _int_env("OPENAI_CIRCUIT_FAIL_THRESHOLD", 3, 1, 100)
+
+
+def _llm_open_seconds() -> int:
+    return _int_env("OPENAI_CIRCUIT_OPEN_SECONDS", 30, 1, 3600)
+
+
+def _llm_circuit_redis_enabled() -> bool:
+    return _bool_env("OPENAI_CIRCUIT_REDIS_ENABLED", True)
+
+
+def _llm_circuit_key(name: str) -> str:
+    return f"circuit:llm:{name}"
+
+
+def _llm_timeout_seconds(*, stream: bool = False) -> float:
+    if stream:
+        raw = os.getenv("OPENAI_STREAM_TIMEOUT_SECONDS", os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
+        return _float_env_from_raw(raw, 30.0, 1.0, 300.0)
+    return _float_env("OPENAI_TIMEOUT_SECONDS", 30.0, 1.0, 300.0)
+
+
+def _float_env_from_raw(raw: object, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(str(raw or "").strip())
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _is_llm_circuit_open() -> tuple[bool, int]:
+    if not _llm_circuit_enabled():
+        return False, 0
+    if _llm_circuit_redis_enabled():
+        try:
+            open_until_raw = redis_client.get_string(_llm_circuit_key("open_until"))
+            open_until = float(open_until_raw or 0)
+            now = time.time()
+            if open_until > now:
+                return True, max(1, int(open_until - now))
+        except Exception:
+            pass
+    with _LLM_CIRCUIT_LOCK:
+        now = time.time()
+        if _LLM_CIRCUIT_OPEN_UNTIL > now:
+            return True, max(1, int(_LLM_CIRCUIT_OPEN_UNTIL - now))
+        return False, 0
+
+
+def _record_llm_success() -> None:
+    if not _llm_circuit_enabled():
+        return
+    if _llm_circuit_redis_enabled():
+        try:
+            redis_client.delete_keys(_llm_circuit_key("failures"), _llm_circuit_key("open_until"))
+        except Exception:
+            pass
+    global _LLM_CIRCUIT_FAILURES, _LLM_CIRCUIT_OPEN_UNTIL
+    with _LLM_CIRCUIT_LOCK:
+        _LLM_CIRCUIT_FAILURES = 0
+        _LLM_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _record_llm_failure() -> None:
+    if not _llm_circuit_enabled():
+        return
+    threshold = _llm_failure_threshold()
+    open_seconds = _llm_open_seconds()
+    if _llm_circuit_redis_enabled():
+        try:
+            redis = redis_client.get_redis()
+            failures_key = _llm_circuit_key("failures")
+            failures = int(redis.incr(failures_key))
+            redis.expire(failures_key, open_seconds)
+            if failures >= threshold:
+                open_until = time.time() + open_seconds
+                redis_client.set_string(
+                    _llm_circuit_key("open_until"),
+                    str(open_until),
+                    ttl_seconds=open_seconds,
+                )
+            return
+        except Exception:
+            pass
+    global _LLM_CIRCUIT_FAILURES, _LLM_CIRCUIT_OPEN_UNTIL
+    with _LLM_CIRCUIT_LOCK:
+        _LLM_CIRCUIT_FAILURES += 1
+        if _LLM_CIRCUIT_FAILURES >= threshold:
+            _LLM_CIRCUIT_OPEN_UNTIL = time.time() + open_seconds
 
 
 def load_level_config(level: str) -> dict[str, Any]:
@@ -664,6 +801,7 @@ def stream_answer_with_citations_official(
     generation_cfg = cfg.get("generation", {})
     max_snippet_chars = int(cfg["citations"]["max_snippet_chars"])
     max_tokens = int(generation_cfg.get("max_tokens", 400))
+    request_timeout_seconds = _llm_timeout_seconds(stream=True)
 
     if not evidence:
         return _attach_meta(
@@ -680,6 +818,15 @@ def stream_answer_with_citations_official(
             repair_used=False,
             failure_reason="missing_api_key",
             attempt_stage="short_circuit",
+        )
+    circuit_open, retry_after = _is_llm_circuit_open()
+    if circuit_open:
+        return _attach_meta(
+            {"answer": "证据不足：模型服务暂时不可用，请稍后重试。", "citations": []},
+            json_ok=False,
+            repair_used=False,
+            failure_reason=f"llm_circuit_open:retry_after={retry_after}",
+            attempt_stage="llm_circuit_open",
         )
 
     evidence_lines = []
@@ -714,6 +861,7 @@ def stream_answer_with_citations_official(
     client = OpenAI(
         api_key=api_key,
         base_url=base_url,
+        timeout=request_timeout_seconds,
     )
 
     reasoning_content = ""
@@ -727,6 +875,7 @@ def stream_answer_with_citations_official(
             max_tokens=max_tokens,
         )
     except Exception as exc:
+        _record_llm_failure()
         return _attach_meta(
             {"answer": "证据不足：模型调用失败。", "citations": []},
             json_ok=False,
@@ -754,6 +903,7 @@ def stream_answer_with_citations_official(
             content_text = str(content_piece)
             content += content_text
             yield {"event": "token", "delta": content_text}
+    _record_llm_success()
 
     data = _extract_json(content)
     if isinstance(data, dict) and "answer" in data:
@@ -813,6 +963,7 @@ async def stream_answer_with_citations_official_async(
     generation_cfg = cfg.get("generation", {})
     max_snippet_chars = int(cfg["citations"]["max_snippet_chars"])
     max_tokens = int(generation_cfg.get("max_tokens", 400))
+    request_timeout_seconds = _llm_timeout_seconds(stream=True)
 
     if not evidence:
         yield {
@@ -835,6 +986,19 @@ async def stream_answer_with_citations_official_async(
                 repair_used=False,
                 failure_reason="missing_api_key",
                 attempt_stage="short_circuit",
+            ),
+        }
+        return
+    circuit_open, retry_after = _is_llm_circuit_open()
+    if circuit_open:
+        yield {
+            "event": "final_result",
+            "result": _attach_meta(
+                {"answer": "证据不足：模型服务暂时不可用，请稍后重试。", "citations": []},
+                json_ok=False,
+                repair_used=False,
+                failure_reason=f"llm_circuit_open:retry_after={retry_after}",
+                attempt_stage="llm_circuit_open",
             ),
         }
         return
@@ -871,6 +1035,7 @@ async def stream_answer_with_citations_official_async(
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
+        timeout=request_timeout_seconds,
     )
 
     content_parts: list[str] = []
@@ -883,6 +1048,7 @@ async def stream_answer_with_citations_official_async(
             max_tokens=max_tokens,
         )
     except Exception as exc:
+        _record_llm_failure()
         yield {
             "event": "final_result",
             "result": _attach_meta(
@@ -913,6 +1079,7 @@ async def stream_answer_with_citations_official_async(
             content_text = str(content_piece)
             content_parts.append(content_text)
             yield {"event": "token", "delta": content_text}
+    _record_llm_success()
 
     content = "".join(content_parts)
     data = _extract_json(content)
@@ -998,6 +1165,15 @@ def answer_with_citations(
             failure_reason="missing_api_key",
             attempt_stage="short_circuit",
         )
+    circuit_open, retry_after = _is_llm_circuit_open()
+    if circuit_open:
+        return _attach_meta(
+            {"answer": "证据不足：模型服务暂时不可用，请稍后重试。", "citations": []},
+            json_ok=False,
+            repair_used=False,
+            failure_reason=f"llm_circuit_open:retry_after={retry_after}",
+            attempt_stage="llm_circuit_open",
+        )
 
     evidence_lines = []
     for idx, ev in enumerate(evidence, start=1):
@@ -1058,10 +1234,12 @@ def answer_with_citations(
     for attempt_model, attempt_max_tokens, attempt_stage in attempts:
         try:
             call_result = _call_llm_final_only(client, attempt_model, messages, attempt_max_tokens)
+            _record_llm_success()
             content = str(call_result.get("content") or "")
             total_usage = _merge_usage(total_usage, dict(call_result.get("usage") or {}))
             token_usage_estimated = token_usage_estimated or bool(call_result.get("usage_estimated"))
         except RuntimeError as exc:
+            _record_llm_failure()
             last_failure_reason = str(exc)
             content = ""
         data = _extract_json(content)

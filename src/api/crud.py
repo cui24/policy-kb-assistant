@@ -14,6 +14,7 @@ L2/L4 CRUD 层：把业务动作落到数据库，并提供查询能力。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -129,13 +130,50 @@ def create_kb_query(db: Session, payload: dict[str, Any]) -> models.KBQuery:
     return record
 
 
+def create_kb_query_with_audit(
+    db: Session,
+    kb_payload: dict[str, Any],
+    audit_payload: dict[str, Any],
+) -> tuple[models.KBQuery, models.AuditLog]:
+    """在同一事务中创建问答记录和对应审计日志。"""
+    normalized_kb_payload = _strip_nul_chars(dict(kb_payload or {}))
+    if "actor_user_id" not in normalized_kb_payload:
+        normalized_kb_payload["actor_user_id"] = str(normalized_kb_payload.get("user_name") or "anonymous")
+
+    kb_record = models.KBQuery(**normalized_kb_payload)
+    db.add(kb_record)
+    db.flush()
+
+    normalized_audit_payload = _strip_nul_chars(dict(audit_payload or {}))
+    if "actor_user_id" not in normalized_audit_payload:
+        normalized_audit_payload["actor_user_id"] = str(normalized_audit_payload.get("actor") or "anonymous")
+    if not normalized_audit_payload.get("target_id"):
+        normalized_audit_payload["target_id"] = kb_record.id
+
+    audit_record = models.AuditLog(**normalized_audit_payload)
+    db.add(audit_record)
+    db.commit()
+    return kb_record, audit_record
+
+
 async def create_kb_query_async(db: Session, payload: dict[str, Any]) -> models.KBQuery:
     """
     异步问答落库入口。
 
     这里保持与同步版本相同的事务/提交路径，避免改变既有一致性语义。
+    同步提交是阻塞调用，丢进线程池执行，避免冻结 event loop（同一请求内串行 await，
+    不会出现多线程并发访问同一 Session）。
     """
-    return create_kb_query(db, payload)
+    return await asyncio.to_thread(create_kb_query, db, payload)
+
+
+async def create_kb_query_with_audit_async(
+    db: Session,
+    kb_payload: dict[str, Any],
+    audit_payload: dict[str, Any],
+) -> tuple[models.KBQuery, models.AuditLog]:
+    """异步组合落库入口：一次事务写问答记录和审计日志。"""
+    return await asyncio.to_thread(create_kb_query_with_audit, db, kb_payload, audit_payload)
 
 
 
@@ -400,8 +438,9 @@ async def create_audit_log_async(db: Session, payload: dict[str, Any]) -> models
     异步审计落库入口。
 
     保留现有同步提交语义，确保和原链路一致。
+    同步提交丢进线程池执行，避免阻塞 event loop。
     """
-    return create_audit_log(db, payload)
+    return await asyncio.to_thread(create_audit_log, db, payload)
 
 
 

@@ -45,14 +45,33 @@ def _resolve_database_url() -> str:
     return os.getenv("DATABASE_URL", "sqlite:///./policy_kb_l2.db")
 
 
+def _int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
 DATABASE_URL = _resolve_database_url()
 _SQLITE_CONNECT_ARGS = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+_ENGINE_KWARGS = {}
+if not DATABASE_URL.startswith("sqlite"):
+    _ENGINE_KWARGS.update(
+        {
+            "pool_size": _int_env("DB_POOL_SIZE", 5, 1, 100),
+            "max_overflow": _int_env("DB_MAX_OVERFLOW", 5, 0, 200),
+            "pool_timeout": _int_env("DB_POOL_TIMEOUT_SECONDS", 30, 1, 300),
+        }
+    )
 
 engine = create_engine(
     DATABASE_URL,
     future=True,
     pool_pre_ping=True,
     connect_args=_SQLITE_CONNECT_ARGS,
+    **_ENGINE_KWARGS,
 )
 SessionLocal = sessionmaker(
     bind=engine,

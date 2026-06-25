@@ -21,34 +21,53 @@ L2 API 入口：把 L0/L1 问答系统包装成可被业务系统调用的 FastA
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI
 
 from src.agent_graph.config import load_agent_graph_config
 from src.agent_graph.mcp_client import check_remote_mcp_health
+from src.api import ask_persist_queue
 from src.api.deps import load_runtime_settings
 from src.api.migrations import ensure_schema_ready
+from src.api.request_timing import RequestTimingMiddleware
 from src.api.routes.agent import router as agent_router
 from src.api.routes.auth import router as auth_router
 from src.api.routes.ask import router as ask_router
 from src.api.routes.history import router as history_router
 from src.api.routes.ops import router as ops_router
 from src.api.routes.tickets import router as tickets_router
+from src.kb.retrieve import warmup_retrieval_stack
 
 
 load_runtime_settings()
 logger = logging.getLogger(__name__)
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
 app = FastAPI(
     title="Policy KB Assistant API",
     version="0.2.0",
 )
+app.add_middleware(RequestTimingMiddleware)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     """启动时优先执行 Alembic 迁移，确保表结构处于最新版本。"""
     ensure_schema_ready()
+    if _env_flag("RETRIEVAL_WARMUP_ON_STARTUP", True):
+        try:
+            detail = warmup_retrieval_stack()
+            logger.info("Retrieval stack warmup completed: %s", detail)
+        except Exception:
+            logger.exception("Retrieval stack warmup failed; continuing startup")
+    ask_persist_queue.start_worker()
     graph_config = load_agent_graph_config()
     if graph_config.mcp_client_enabled and graph_config.mcp_check_on_startup:
         ok, detail = check_remote_mcp_health(
@@ -62,6 +81,12 @@ def on_startup() -> None:
             if graph_config.mcp_startup_strict:
                 raise RuntimeError(message)
             logger.warning("%s (non-strict mode, continue startup)", message)
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    """服务停止时尽量刷完 ASK 异步持久化队列。"""
+    await ask_persist_queue.stop_worker()
 
 
 @app.get("/health")

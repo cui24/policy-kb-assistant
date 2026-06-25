@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from src.api import ask_cache, crud
 from src.kb.answer import answer_with_citations, answer_with_citations_async
-from src.kb.retrieve import retrieve, retrieve_async
+from src.kb.retrieve import retrieve, retrieve_async, retrieve_with_query_vector
 
 
 def new_request_id() -> str:
@@ -46,10 +46,13 @@ def trim_hits_for_trace(hits: list[dict], limit: int = 6) -> list[dict]:
     return trimmed
 
 
-def run_retrieve_step(question: str) -> tuple[list[dict], int]:
+def run_retrieve_step(question: str, *, query_vector: list[float] | None = None) -> tuple[list[dict], int]:
     """执行检索步骤，返回命中和耗时（ms）。"""
     started = time.perf_counter()
-    hits = retrieve(question)
+    if query_vector is not None:
+        hits = retrieve_with_query_vector(question, query_vector)
+    else:
+        hits = retrieve(question)
     latency_ms = int((time.perf_counter() - started) * 1000)
     return hits, latency_ms
 
@@ -62,10 +65,14 @@ def run_answer_step(question: str, hits: list[dict]) -> tuple[dict[str, Any], in
     return output, latency_ms
 
 
-async def run_retrieve_step_async(question: str) -> tuple[list[dict], int]:
+async def run_retrieve_step_async(
+    question: str,
+    *,
+    query_vector: list[float] | None = None,
+) -> tuple[list[dict], int]:
     """执行异步检索步骤，返回命中和耗时（ms）。"""
     started = time.perf_counter()
-    hits = await retrieve_async(question)
+    hits = await retrieve_async(question, query_vector=query_vector)
     latency_ms = int((time.perf_counter() - started) * 1000)
     return hits, latency_ms
 
@@ -84,7 +91,10 @@ def run_cached_ask_steps(question: str, department: str | None = None) -> dict[s
     if cache_lookup.normalized is not None:
         return cache_lookup.normalized
 
-    hits, retrieve_ms = run_retrieve_step(question)
+    if cache_lookup.query_vector is not None:
+        hits, retrieve_ms = run_retrieve_step(question, query_vector=cache_lookup.query_vector)
+    else:
+        hits, retrieve_ms = run_retrieve_step(question)
     output, answer_ms = run_answer_step(question, hits)
     normalized = normalize_answer_payload(
         output=output,
@@ -107,7 +117,10 @@ async def run_cached_ask_steps_async(question: str, department: str | None = Non
     if cache_lookup.normalized is not None:
         return cache_lookup.normalized
 
-    hits, retrieve_ms = await run_retrieve_step_async(question)
+    if cache_lookup.query_vector is not None:
+        hits, retrieve_ms = await run_retrieve_step_async(question, query_vector=cache_lookup.query_vector)
+    else:
+        hits, retrieve_ms = await run_retrieve_step_async(question)
     output, answer_ms = await run_answer_step_async(question, hits)
     normalized = normalize_answer_payload(
         output=output,

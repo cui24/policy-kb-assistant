@@ -61,6 +61,7 @@ class AskMeta(BaseModel):
     latency_ms: dict[str, int]
     usage: dict[str, Any] = Field(default_factory=dict)
     cache: dict[str, Any] = Field(default_factory=dict)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class AskResponse(BaseModel):

@@ -80,6 +80,8 @@ import asyncio
 import hashlib
 import os
 import re
+import threading
+import time
 from functools import lru_cache
 from typing import Any
 
@@ -87,10 +89,135 @@ import yaml
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 
+from src.api import redis_client
+
 try:
     from rank_bm25 import BM25Okapi
 except Exception:  # pragma: no cover - optional runtime dependency guard
     BM25Okapi = None
+
+
+_QDRANT_CIRCUIT_LOCK = threading.Lock()
+_QDRANT_CIRCUIT_FAILURES = 0
+_QDRANT_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _float_env(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = str(os.getenv(name) or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def reset_qdrant_circuit_breaker() -> None:
+    """重置 Qdrant 熔断状态，主要供测试或人工恢复使用。"""
+    global _QDRANT_CIRCUIT_FAILURES, _QDRANT_CIRCUIT_OPEN_UNTIL
+    with _QDRANT_CIRCUIT_LOCK:
+        _QDRANT_CIRCUIT_FAILURES = 0
+        _QDRANT_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _qdrant_timeout_seconds() -> float:
+    return _float_env("QDRANT_TIMEOUT_SECONDS", 5.0, 0.2, 120.0)
+
+
+def _qdrant_circuit_enabled() -> bool:
+    return _bool_env("QDRANT_CIRCUIT_BREAKER_ENABLED", True)
+
+
+def _qdrant_failure_threshold() -> int:
+    return _int_env("QDRANT_CIRCUIT_FAIL_THRESHOLD", 3, 1, 100)
+
+
+def _qdrant_open_seconds() -> int:
+    return _int_env("QDRANT_CIRCUIT_OPEN_SECONDS", 30, 1, 3600)
+
+
+def _qdrant_circuit_redis_enabled() -> bool:
+    return _bool_env("QDRANT_CIRCUIT_REDIS_ENABLED", True)
+
+
+def _qdrant_circuit_key(name: str) -> str:
+    return f"circuit:qdrant:{name}"
+
+
+def _is_qdrant_circuit_open() -> tuple[bool, int]:
+    if not _qdrant_circuit_enabled():
+        return False, 0
+    if _qdrant_circuit_redis_enabled():
+        try:
+            open_until_raw = redis_client.get_string(_qdrant_circuit_key("open_until"))
+            open_until = float(open_until_raw or 0)
+            now = time.time()
+            if open_until > now:
+                return True, max(1, int(open_until - now))
+        except Exception:
+            pass
+    with _QDRANT_CIRCUIT_LOCK:
+        now = time.time()
+        if _QDRANT_CIRCUIT_OPEN_UNTIL > now:
+            return True, max(1, int(_QDRANT_CIRCUIT_OPEN_UNTIL - now))
+        return False, 0
+
+
+def _record_qdrant_success() -> None:
+    if not _qdrant_circuit_enabled():
+        return
+    if _qdrant_circuit_redis_enabled():
+        try:
+            redis_client.delete_keys(_qdrant_circuit_key("failures"), _qdrant_circuit_key("open_until"))
+        except Exception:
+            pass
+    global _QDRANT_CIRCUIT_FAILURES, _QDRANT_CIRCUIT_OPEN_UNTIL
+    with _QDRANT_CIRCUIT_LOCK:
+        _QDRANT_CIRCUIT_FAILURES = 0
+        _QDRANT_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _record_qdrant_failure() -> None:
+    if not _qdrant_circuit_enabled():
+        return
+    threshold = _qdrant_failure_threshold()
+    open_seconds = _qdrant_open_seconds()
+    if _qdrant_circuit_redis_enabled():
+        try:
+            redis = redis_client.get_redis()
+            failures_key = _qdrant_circuit_key("failures")
+            failures = int(redis.incr(failures_key))
+            redis.expire(failures_key, open_seconds)
+            if failures >= threshold:
+                open_until = time.time() + open_seconds
+                redis_client.set_string(
+                    _qdrant_circuit_key("open_until"),
+                    str(open_until),
+                    ttl_seconds=open_seconds,
+                )
+            return
+        except Exception:
+            pass
+    global _QDRANT_CIRCUIT_FAILURES, _QDRANT_CIRCUIT_OPEN_UNTIL
+    with _QDRANT_CIRCUIT_LOCK:
+        _QDRANT_CIRCUIT_FAILURES += 1
+        if _QDRANT_CIRCUIT_FAILURES >= threshold:
+            _QDRANT_CIRCUIT_OPEN_UNTIL = time.time() + open_seconds
 
 
 def load_level_config(level: str) -> dict[str, Any]:
@@ -184,7 +311,7 @@ def _tokenize_for_bm25(text: str) -> list[str]:
 
 def _get_qdrant_client(qdrant_url: str) -> QdrantClient:
     """集中创建 QdrantClient，便于 dense 与 BM25 共用。"""
-    return QdrantClient(url=qdrant_url)
+    return QdrantClient(url=qdrant_url, timeout=_qdrant_timeout_seconds())
 
 
 def _query_qdrant_dense(
@@ -425,7 +552,12 @@ def warmup_retrieval_stack() -> dict[str, Any]:
     }
 
 
-def retrieve(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
+def _retrieve_impl(
+    query: str,
+    top_k: int | None = None,
+    *,
+    query_vector: list[float] | None = None,
+) -> list[dict[str, Any]]:
     """
     从 Qdrant 召回与问题最相关的证据块。
     返回统一的 list[dict]，这样 answer/eval/api 就不需要感知底层向量库对象格式。
@@ -467,20 +599,32 @@ def retrieve(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
     rerank_batch_size = _positive_int(os.getenv("RERANK_BATCH_SIZE") or rerank_cfg.get("batch_size"), 8)
     rerank_max_chars = _positive_int(os.getenv("RERANK_MAX_CHARS") or rerank_cfg.get("max_chars"), 1200)
 
-    """检索阶段必须和入库阶段使用同一 embedding 模型，否则向量空间不一致，结果会失真。"""
-    """这里复用进程内缓存模型，避免回归集逐题重复加载。"""
-    model = _get_embedding_model(embed_model)
-    qvec = model.encode([query], normalize_embeddings=True).tolist()[0]
+    if query_vector is None:
+        """检索阶段必须和入库阶段使用同一 embedding 模型，否则向量空间不一致，结果会失真。"""
+        """这里复用进程内缓存模型，避免回归集逐题重复加载。"""
+        model = _get_embedding_model(embed_model)
+        qvec = model.encode([query], normalize_embeddings=True).tolist()[0]
+    else:
+        qvec = [float(value) for value in query_vector]
+
+    circuit_open, retry_after = _is_qdrant_circuit_open()
+    if circuit_open:
+        return []
 
     client = _get_qdrant_client(qdrant_url)
 
     dense_limit = dense_candidate_k if retrieval_mode == "hybrid" else top_k
-    dense_hits = _query_qdrant_dense(
-        client,
-        collection=collection,
-        query_vector=qvec,
-        limit=dense_limit,
-    )
+    try:
+        dense_hits = _query_qdrant_dense(
+            client,
+            collection=collection,
+            query_vector=qvec,
+            limit=dense_limit,
+        )
+        _record_qdrant_success()
+    except Exception:
+        _record_qdrant_failure()
+        return []
     for hit in dense_hits:
         hit["retrieval_source"] = "dense"
 
@@ -535,8 +679,32 @@ def retrieve(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
         return fused_hits[:top_k]
 
 
-async def retrieve_async(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
+def retrieve(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
+    """
+    从 Qdrant 召回与问题最相关的证据块。
+    返回统一的 list[dict]，这样 answer/eval/api 就不需要感知底层向量库对象格式。
+    """
+    return _retrieve_impl(query, top_k)
+
+
+def retrieve_with_query_vector(
+    query: str,
+    query_vector: list[float],
+    top_k: int | None = None,
+) -> list[dict[str, Any]]:
+    """使用已计算的 query 向量检索，避免语义缓存 miss 后重复 encode。"""
+    return _retrieve_impl(query, top_k, query_vector=query_vector)
+
+
+async def retrieve_async(
+    query: str,
+    top_k: int | None = None,
+    *,
+    query_vector: list[float] | None = None,
+) -> list[dict[str, Any]]:
     """异步检索入口：在线程池中复用现有同步检索逻辑。"""
+    if query_vector is not None:
+        return await asyncio.to_thread(retrieve_with_query_vector, query, query_vector, top_k)
     return await asyncio.to_thread(retrieve, query, top_k)
 
 

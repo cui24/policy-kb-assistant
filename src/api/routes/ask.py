@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from src.api import models
 from src.api.deps import get_db
-from src.api.deps_auth import get_current_active_user
+from src.api.deps_auth import AuthenticatedUser, get_current_active_user
 from src.api.schemas import AskRequest, AskResponse
 from src.api.services import public_kb_response, run_ask_workflow_async, run_ask_workflow_stream_async
 
@@ -31,9 +30,10 @@ def _sse(event: str, data: dict) -> str:
 
 @router.post("/ask", response_model=AskResponse)
 async def ask(
+    request: Request,
     payload: AskRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
 ) -> AskResponse:
     """执行问答接口。"""
     result = await run_ask_workflow_async(
@@ -42,6 +42,7 @@ async def ask(
         user=str(current_user.username),
         department=payload.department,
         actor_user_id=str(current_user.id),
+        auth_ms=int(getattr(request.state, "auth_ms", 0) or 0),
     )
     return public_kb_response(result)
 
@@ -49,7 +50,7 @@ async def ask(
 async def ask_stream(
     payload: AskRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
 ) -> StreamingResponse:
     """SSE 流式问答接口。"""
     async def event_generator():

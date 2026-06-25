@@ -28,7 +28,7 @@ import src.api.app as api_app_module
 from src.api.schemas import ToolPlan
 from src.api.db import Base
 from src.api.deps import get_db, get_redis_dep
-from src.api import crud, models, services
+from src.api import auth_cache, crud, models, services
 
 
 class _FakeRedis:
@@ -36,6 +36,7 @@ class _FakeRedis:
 
     def __init__(self) -> None:
         self._store: dict[str, object] = {}
+        self.expire_calls: list[tuple[str, int]] = []
 
     def incr(self, key: str) -> int:
         current = int(self._store.get(key, 0) or 0) + 1
@@ -43,7 +44,19 @@ class _FakeRedis:
         return current
 
     def expire(self, key: str, seconds: int) -> bool:
+        self.expire_calls.append((str(key), int(seconds)))
         return True
+
+    def hset(self, key: str, mapping: dict[str, object] | None = None, **kwargs) -> int:
+        current = dict(self._store.get(key, {}) or {})
+        payload = dict(mapping or {})
+        payload.update(kwargs)
+        current.update({str(field): str(value) for field, value in payload.items()})
+        self._store[key] = current
+        return len(payload)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        return dict(self._store.get(key, {}) or {})
 
     def set(self, key: str, value: object, ex: int | None = None, nx: bool = False) -> bool:
         if nx and key in self._store:
@@ -58,6 +71,13 @@ class _FakeRedis:
         existed = key in self._store
         self._store.pop(key, None)
         return 1 if existed else 0
+
+
+class _FailingAuthRedis(_FakeRedis):
+    """只让鉴权 Hash 读取失败，用于验证本地短 TTL 兜底。"""
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        raise RuntimeError("redis_down")
 
 
 def _build_test_session() -> Session:
@@ -143,6 +163,172 @@ def _auth_headers(client: TestClient, username: str = "alice") -> dict[str, str]
     assert response.status_code == 200
     token = str(response.json()["access_token"])
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_auth_writes_user_snapshot_to_redis_and_uses_it(monkeypatch) -> None:
+    """登录态应依赖 Redis Hash 用户快照，而不是每次查 users 表。"""
+    db = _build_test_session()
+    fake_redis = _FakeRedis()
+
+    def _override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
+    api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    api_app_module.app.dependency_overrides[get_redis_dep] = lambda: fake_redis
+
+    try:
+        with TestClient(api_app_module.app) as client:
+            response = client.post(
+                "/auth/register",
+                json={"username": "redis_auth_user", "password": "TestPassword123"},
+            )
+            assert response.status_code == 200
+            user_id = str(response.json()["user"]["id"])
+            key = auth_cache.auth_user_key(user_id)
+            assert fake_redis.hgetall(key)["username"] == "redis_auth_user"
+
+            headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+            me_response = client.get("/auth/me", headers=headers)
+            assert me_response.status_code == 200
+            assert me_response.json()["username"] == "redis_auth_user"
+            assert fake_redis.expire_calls.count((key, auth_cache.DEFAULT_AUTH_USER_TTL_SECONDS)) >= 2
+    finally:
+        api_app_module.app.dependency_overrides.clear()
+        db.close()
+
+
+def test_request_timing_middleware_adds_header(monkeypatch) -> None:
+    """所有请求都应经过统一 timing middleware。"""
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
+    try:
+        with TestClient(api_app_module.app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+            assert response.headers.get("X-Request-Timing-Total-Ms") is not None
+    finally:
+        api_app_module.app.dependency_overrides.clear()
+
+
+def test_auth_rejects_inactive_redis_snapshot(monkeypatch) -> None:
+    """Redis Hash 中单独 HSET is_active=0 后，后续请求应被拒绝。"""
+    db = _build_test_session()
+    fake_redis = _FakeRedis()
+
+    def _override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
+    api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    api_app_module.app.dependency_overrides[get_redis_dep] = lambda: fake_redis
+
+    try:
+        with TestClient(api_app_module.app) as client:
+            response = client.post(
+                "/auth/register",
+                json={"username": "inactive_redis_user", "password": "TestPassword123"},
+            )
+            assert response.status_code == 200
+            user_id = str(response.json()["user"]["id"])
+            fake_redis.hset(auth_cache.auth_user_key(user_id), mapping={"is_active": "0"})
+
+            headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+            rejected = client.get("/auth/me", headers=headers)
+            assert rejected.status_code == 403
+            assert rejected.json()["detail"] == "user_inactive"
+    finally:
+        api_app_module.app.dependency_overrides.clear()
+        db.close()
+
+
+def test_auth_uses_local_short_ttl_snapshot_when_redis_read_fails(monkeypatch) -> None:
+    """Redis 鉴权快照短暂不可用时，可复用最近成功读取过的本地快照。"""
+    monkeypatch.setenv("AUTH_LOCAL_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("AUTH_LOCAL_FALLBACK_TTL_SECONDS", "30")
+    monkeypatch.setenv("AUTH_JWT_ONLY_FALLBACK_ENABLED", "true")
+    auth_cache.reset_local_auth_cache()
+    db = _build_test_session()
+    fake_redis = _FakeRedis()
+
+    def _override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
+    api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    api_app_module.app.dependency_overrides[get_redis_dep] = lambda: fake_redis
+
+    try:
+        with TestClient(api_app_module.app) as client:
+            response = client.post(
+                "/auth/register",
+                json={"username": "local_auth_user", "password": "TestPassword123"},
+            )
+            assert response.status_code == 200
+            headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+            first = client.get("/auth/me", headers=headers)
+            assert first.status_code == 200
+            assert first.json()["username"] == "local_auth_user"
+
+            api_app_module.app.dependency_overrides[get_redis_dep] = lambda: _FailingAuthRedis()
+            second = client.get("/auth/me", headers=headers)
+            assert second.status_code == 200
+            assert second.json()["username"] == "local_auth_user"
+            assert second.headers.get("X-Auth-Fallback") == "true"
+            assert second.headers.get("X-Auth-Fallback-Mode") == "local_snapshot"
+    finally:
+        api_app_module.app.dependency_overrides.clear()
+        auth_cache.reset_local_auth_cache()
+        db.close()
+
+
+def test_auth_uses_jwt_only_fallback_when_redis_fails_and_local_snapshot_missing(monkeypatch) -> None:
+    """多 Worker 场景下本进程无本地快照时，可基于已验签 JWT 短暂放行。"""
+    monkeypatch.setenv("AUTH_LOCAL_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("AUTH_JWT_ONLY_FALLBACK_ENABLED", "true")
+    auth_cache.reset_local_auth_cache()
+    db = _build_test_session()
+    fake_redis = _FakeRedis()
+
+    def _override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", lambda: None)
+    api_app_module.app.dependency_overrides[get_db] = _override_get_db
+    api_app_module.app.dependency_overrides[get_redis_dep] = lambda: fake_redis
+
+    try:
+        with TestClient(api_app_module.app) as client:
+            response = client.post(
+                "/auth/register",
+                json={"username": "jwt_only_user", "password": "TestPassword123"},
+            )
+            assert response.status_code == 200
+            headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+            auth_cache.reset_local_auth_cache()
+            api_app_module.app.dependency_overrides[get_redis_dep] = lambda: _FailingAuthRedis()
+            fallback = client.get("/auth/me", headers=headers)
+            assert fallback.status_code == 200
+            assert fallback.json()["username"] == "jwt_only_user"
+            assert fallback.headers.get("X-Auth-Fallback") == "true"
+            assert fallback.headers.get("X-Auth-Fallback-Mode") == "jwt_only"
+    finally:
+        api_app_module.app.dependency_overrides.clear()
+        auth_cache.reset_local_auth_cache()
+        db.close()
 
 
 

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import time
@@ -30,6 +31,8 @@ CACHE_SCHEMA_VERSION = "v1"
 DEFAULT_TTL_SECONDS = 3600
 MAX_TTL_SECONDS = 7 * 24 * 3600
 MAX_QUESTION_CHARS = 500
+DEFAULT_SEMANTIC_THRESHOLD = 0.97
+DEFAULT_SEMANTIC_MAX_CANDIDATES = 200
 
 _CACHE_META_KEYS = {
     "cache_hit",
@@ -39,6 +42,9 @@ _CACHE_META_KEYS = {
     "cache_created_at",
     "cache_origin_attempt_stage",
     "cache_origin_latency_ms",
+    "cache_match_type",
+    "cache_similarity",
+    "cache_matched_question",
 }
 
 
@@ -61,6 +67,7 @@ class AskCacheLookup:
     latency_ms: int
     status: str
     error: str | None = None
+    query_vector: list[float] | None = None
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -94,6 +101,32 @@ def is_enabled() -> bool:
     """
     load_dotenv()
     return _bool_env("ASK_CACHE_ENABLED", False)
+
+
+def semantic_cache_enabled() -> bool:
+    """判断是否启用 ASK 语义缓存；默认关闭，避免误命中。"""
+    load_dotenv()
+    return _bool_env("ASK_SEMANTIC_CACHE_ENABLED", False)
+
+
+def semantic_threshold() -> float:
+    """读取语义缓存相似度阈值，默认使用偏保守的 0.97。"""
+    raw = str(os.getenv("ASK_SEMANTIC_CACHE_THRESHOLD") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = DEFAULT_SEMANTIC_THRESHOLD
+    return min(0.9999, max(0.90, value))
+
+
+def semantic_max_candidates() -> int:
+    """读取语义缓存最多比较候选数，避免 Redis 小索引被无限扫描。"""
+    raw = str(os.getenv("ASK_SEMANTIC_CACHE_MAX_CANDIDATES") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_SEMANTIC_MAX_CANDIDATES
+    return max(1, min(value, 2000))
 
 
 def ttl_seconds() -> int:
@@ -192,6 +225,11 @@ def _context_fingerprint(department: str | None) -> dict[str, str]:
     }
 
 
+def _context_digest(department: str | None) -> str:
+    raw = repr(_context_fingerprint(department))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def cache_key(question: str, department: str | None) -> str:
     """生成当前问题对应的 Redis 缓存 key。
 
@@ -217,6 +255,38 @@ def cache_key(question: str, department: str | None) -> str:
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"ask:cache:{CACHE_SCHEMA_VERSION}:{digest}"
+
+
+def semantic_index_key(department: str | None) -> str:
+    """同一上下文指纹下的语义缓存候选索引 key。"""
+    return f"ask:cache:{CACHE_SCHEMA_VERSION}:semantic:{_context_digest(department)}"
+
+
+def _question_embedding(question: str) -> list[float]:
+    """复用检索 embedding 模型生成问题向量；只在语义缓存开启时调用。"""
+    from src.kb.retrieve import _get_embedding_model
+
+    load_dotenv()
+    model_name = _env_value("EMBED_MODEL", "BAAI/bge-large-zh-v1.5")
+    model = _get_embedding_model(model_name)
+    vector = model.encode([normalize_question(question)], normalize_embeddings=True).tolist()[0]
+    return [float(item) for item in vector]
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = 0.0
+    left_norm = 0.0
+    right_norm = 0.0
+    for a, b in zip(left, right, strict=False):
+        dot += float(a) * float(b)
+        left_norm += float(a) * float(a)
+        right_norm += float(b) * float(b)
+    denominator = math.sqrt(left_norm) * math.sqrt(right_norm)
+    if denominator <= 0:
+        return 0.0
+    return dot / denominator
 
 
 def _strip_cache_meta(output_meta: dict[str, Any] | None) -> dict[str, Any]:
@@ -261,6 +331,42 @@ def _cacheable_normalized(normalized: dict[str, Any]) -> dict[str, Any]:
         "answer_ms": int(normalized.get("answer_ms") or 0),
     }
     return payload
+
+
+def _cached_lookup_result(
+    *,
+    key: str | None,
+    cached: dict[str, Any],
+    payload: dict[str, Any],
+    latency_ms: int,
+    status: str,
+    match_type: str,
+    similarity: float | None = None,
+) -> AskCacheLookup:
+    output_meta = dict(cached.get("output_meta") or {})
+    origin_latency = {
+        "retrieve": int(cached.get("retrieve_ms") or 0),
+        "answer": int(cached.get("answer_ms") or 0),
+    }
+    output_meta["cache_hit"] = True
+    output_meta["cache_status"] = status
+    if key:
+        output_meta["cache_key"] = key
+    output_meta["cache_lookup_ms"] = latency_ms
+    output_meta["cache_created_at"] = payload.get("created_at")
+    output_meta["cache_origin_attempt_stage"] = str(output_meta.get("attempt_stage") or "unknown")
+    output_meta["cache_origin_latency_ms"] = origin_latency
+    output_meta["cache_match_type"] = match_type
+    if similarity is not None:
+        output_meta["cache_similarity"] = round(float(similarity), 6)
+    if payload.get("question"):
+        output_meta["cache_matched_question"] = str(payload.get("question"))
+    output_meta["attempt_stage"] = "cache_hit" if match_type == "exact" else "semantic_cache_hit"
+
+    cached["output_meta"] = output_meta
+    cached["retrieve_ms"] = 0
+    cached["answer_ms"] = 0
+    return AskCacheLookup(True, key, cached, latency_ms, status)
 
 
 def is_cacheable(normalized: dict[str, Any]) -> bool:
@@ -314,31 +420,87 @@ def read_cached_answer(question: str, department: str | None) -> AskCacheLookup:
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     if not isinstance(payload, dict):
-        return AskCacheLookup(True, key, None, latency_ms, "miss")
+        return _read_semantic_cached_answer(question, department, key, started)
 
     normalized = payload.get("normalized")
     if not isinstance(normalized, dict):
         return AskCacheLookup(True, key, None, latency_ms, "invalid")
 
     cached = _cacheable_normalized(normalized)
-    output_meta = dict(cached.get("output_meta") or {})
-    origin_latency = {
-        "retrieve": int(cached.get("retrieve_ms") or 0),
-        "answer": int(cached.get("answer_ms") or 0),
-    }
-    output_meta["cache_hit"] = True
-    output_meta["cache_status"] = "hit"
-    output_meta["cache_key"] = key
-    output_meta["cache_lookup_ms"] = latency_ms
-    output_meta["cache_created_at"] = payload.get("created_at")
-    output_meta["cache_origin_attempt_stage"] = str(output_meta.get("attempt_stage") or "unknown")
-    output_meta["cache_origin_latency_ms"] = origin_latency
-    output_meta["attempt_stage"] = "cache_hit"
+    return _cached_lookup_result(
+        key=key,
+        cached=cached,
+        payload=payload,
+        latency_ms=latency_ms,
+        status="hit",
+        match_type="exact",
+    )
 
-    cached["output_meta"] = output_meta
-    cached["retrieve_ms"] = 0
-    cached["answer_ms"] = 0
-    return AskCacheLookup(True, key, cached, latency_ms, "hit")
+
+def _read_semantic_cached_answer(
+    question: str,
+    department: str | None,
+    exact_key: str,
+    started: float,
+) -> AskCacheLookup:
+    if not semantic_cache_enabled():
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "miss")
+    try:
+        query_vector = _question_embedding(question)
+        index_payload = redis_client.get_json(semantic_index_key(department))
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_error", exc.__class__.__name__)
+    if not isinstance(index_payload, dict):
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_miss", query_vector=query_vector)
+
+    candidates = index_payload.get("items")
+    if not isinstance(candidates, list):
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_miss", query_vector=query_vector)
+
+    best_item: dict[str, Any] | None = None
+    best_score = 0.0
+    for item in candidates[: semantic_max_candidates()]:
+        if not isinstance(item, dict):
+            continue
+        vector = item.get("embedding")
+        if not isinstance(vector, list):
+            continue
+        score = _cosine_similarity(query_vector, [float(value) for value in vector])
+        if score > best_score:
+            best_score = score
+            best_item = item
+
+    if best_item is None or best_score < semantic_threshold():
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_miss", query_vector=query_vector)
+
+    matched_key = str(best_item.get("key") or "")
+    if not matched_key:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_miss", query_vector=query_vector)
+    try:
+        payload = redis_client.get_json(matched_key)
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_error", exc.__class__.__name__)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    if not isinstance(payload, dict) or not isinstance(payload.get("normalized"), dict):
+        return AskCacheLookup(True, exact_key, None, latency_ms, "semantic_invalid")
+
+    cached = _cacheable_normalized(payload["normalized"])
+    return _cached_lookup_result(
+        key=matched_key,
+        cached=cached,
+        payload=payload,
+        latency_ms=latency_ms,
+        status="semantic_hit",
+        match_type="semantic",
+        similarity=best_score,
+    )
 
 
 def write_cached_answer(
@@ -381,9 +543,42 @@ def write_cached_answer(
     }
     try:
         redis_client.set_json(resolved_key, payload, ttl_seconds=ttl_seconds())
+        if semantic_cache_enabled():
+            _upsert_semantic_index_item(
+                key=resolved_key,
+                question=question,
+                department=department,
+                created_at=str(payload["created_at"]),
+            )
     except Exception:
         return "store_failed"
     return "stored"
+
+
+def _upsert_semantic_index_item(*, key: str, question: str, department: str | None, created_at: str) -> None:
+    index_key = semantic_index_key(department)
+    payload = redis_client.get_json(index_key)
+    if not isinstance(payload, dict):
+        payload = {
+            "schema": CACHE_SCHEMA_VERSION,
+            "context": _context_fingerprint(department),
+            "items": [],
+        }
+    items = payload.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    normalized_question = normalize_question(question)
+    embedding = _question_embedding(normalized_question)
+    fresh_item = {
+        "key": key,
+        "question": normalized_question,
+        "embedding": embedding,
+        "created_at": created_at,
+    }
+    deduped = [item for item in items if not isinstance(item, dict) or item.get("key") != key]
+    payload["items"] = [fresh_item, *deduped][: semantic_max_candidates()]
+    redis_client.set_json(index_key, payload, ttl_seconds=ttl_seconds())
 
 
 def mark_cache_status(
@@ -414,6 +609,8 @@ def mark_cache_status(
     output_meta["cache_lookup_ms"] = int(lookup.latency_ms or 0)
     if lookup.error:
         output_meta["cache_error"] = lookup.error
+    if lookup.status:
+        output_meta["cache_lookup_status"] = lookup.status
     updated = dict(normalized)
     updated["output_meta"] = output_meta
     return updated
@@ -449,4 +646,10 @@ def cache_meta_from_output_meta(output_meta: dict[str, Any] | None) -> dict[str,
         result["origin_attempt_stage"] = meta.get("cache_origin_attempt_stage")
     if isinstance(meta.get("cache_origin_latency_ms"), dict):
         result["origin_latency_ms"] = meta.get("cache_origin_latency_ms")
+    if meta.get("cache_match_type"):
+        result["match_type"] = meta.get("cache_match_type")
+    if meta.get("cache_similarity") is not None:
+        result["similarity"] = meta.get("cache_similarity")
+    if meta.get("cache_matched_question"):
+        result["matched_question"] = meta.get("cache_matched_question")
     return result

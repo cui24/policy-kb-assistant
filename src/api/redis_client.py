@@ -24,6 +24,7 @@ from redis.exceptions import RedisError
 
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+DEFAULT_REDIS_MAX_CONNECTIONS = 20
 
 
 class RedisClientError(RuntimeError):
@@ -35,6 +36,16 @@ def _resolve_redis_url() -> str:
     load_dotenv()
     normalized = str(os.getenv("REDIS_URL") or "").strip()
     return normalized or DEFAULT_REDIS_URL
+
+
+def _redis_max_connections() -> int:
+    """读取单 worker Redis 连接池上限。"""
+    raw = str(os.getenv("REDIS_MAX_CONNECTIONS") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_REDIS_MAX_CONNECTIONS
+    return max(2, min(value, 200))
 
 
 class RedisClient:
@@ -50,6 +61,7 @@ class RedisClient:
             socket_connect_timeout=2.0,
             health_check_interval=30,
             retry_on_timeout=True,
+            max_connections=_redis_max_connections(),
         )
 
     def get_redis(self) -> Redis:

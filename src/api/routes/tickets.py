@@ -14,9 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from redis import Redis
 from sqlalchemy.orm import Session
 
-from src.api import crud, models
+from src.api import crud
 from src.api.deps import get_db, get_redis_dep
-from src.api.deps_auth import get_current_active_user
+from src.api.deps_auth import AuthenticatedUser, get_current_active_user
 from src.api.idempotency import (
     IdempotencyStoreError,
     abort_idempotent_request,
@@ -67,7 +67,7 @@ def _role_value(role: object) -> str:
     return str(role or "").strip().lower()
 
 
-def _ensure_ticket_owner_or_admin(db: Session, ticket_id: str, current_user: models.User) -> None:
+def _ensure_ticket_owner_or_admin(db: Session, ticket_id: str, current_user: AuthenticatedUser) -> None:
     """仅允许工单 owner 或 admin/support 执行写操作。"""
     ticket = crud.get_ticket_by_public_id(db, ticket_id)
     if ticket is None:
@@ -104,7 +104,7 @@ def _ensure_ticket_owner_or_admin(db: Session, ticket_id: str, current_user: mod
 def create_ticket(
     payload: TicketCreateRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
     redis: Redis = Depends(get_redis_dep),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> TicketResponse:
@@ -227,7 +227,7 @@ def get_ticket(ticket_id: str, db: Session = Depends(get_db)) -> TicketDetailRes
         Swagger 会知道这个接口返回什么字段。
 
     --记录依赖项
-    current_user: models.User = Depends(get_current_active_user)
+    current_user: AuthenticatedUser = Depends(get_current_active_user)
     表示：
         在执行这个接口前，先解析并校验 Bearer Token
     这里的意思大概率是：
@@ -248,7 +248,7 @@ def update_ticket_status(
     ticket_id: str,
     payload: TicketStatusUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
 ) -> TicketDetailResponse:
     """更新工单状态。"""
     _ensure_ticket_owner_or_admin(db, ticket_id, current_user)
@@ -269,7 +269,7 @@ def add_ticket_comment(
     ticket_id: str,
     payload: TicketCommentRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
 ) -> TicketDetailResponse:
     """向工单追加说明。"""
     _ensure_ticket_owner_or_admin(db, ticket_id, current_user)
@@ -290,7 +290,7 @@ def escalate_ticket(
     ticket_id: str,
     payload: TicketEscalateRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
 ) -> TicketDetailResponse:
     """催办工单。"""
     _ensure_ticket_owner_or_admin(db, ticket_id, current_user)
@@ -311,7 +311,7 @@ def cancel_ticket(
     ticket_id: str,
     payload: TicketCancelRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
 ) -> TicketDetailResponse:
     """取消工单。"""
     _ensure_ticket_owner_or_admin(db, ticket_id, current_user)

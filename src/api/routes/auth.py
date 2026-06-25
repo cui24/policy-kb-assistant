@@ -17,8 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.api import crud, models
+from src.api.auth_cache import AuthCacheError, write_auth_user
 from src.api.deps import get_db, get_redis_dep
-from src.api.deps_auth import get_current_active_user
+from src.api.deps_auth import AuthenticatedUser, get_current_active_user
 from src.api.rate_limit import (
     RateLimitStoreError,
     auth_login_ip_limit,
@@ -63,7 +64,7 @@ def _serialize_user(user: models.User) -> UserProfileResponse:
     )
 
 
-def _build_auth_response(user: models.User) -> AuthTokenResponse:
+def _build_auth_response(user: models.User, redis: Redis) -> AuthTokenResponse:
     """统一构建鉴权响应。"""
     role_value = _role_value(user.role)
     token = create_access_token(
@@ -71,6 +72,10 @@ def _build_auth_response(user: models.User) -> AuthTokenResponse:
         username=str(user.username),
         role=role_value,
     )
+    try:
+        write_auth_user(redis, user)
+    except AuthCacheError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return AuthTokenResponse(
         access_token=token,
         token_type="bearer",
@@ -80,7 +85,11 @@ def _build_auth_response(user: models.User) -> AuthTokenResponse:
 
 
 @router.post("/register", response_model=AuthTokenResponse)
-def register(payload: AuthRegisterRequest, db: Session = Depends(get_db)) -> AuthTokenResponse:
+def register(
+    payload: AuthRegisterRequest,
+    db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis_dep),
+) -> AuthTokenResponse:
     """注册新用户，并直接返回登录态 token。"""
     username = str(payload.username or "").strip()
     email = str(payload.email or "").strip() or None
@@ -113,7 +122,7 @@ def register(payload: AuthRegisterRequest, db: Session = Depends(get_db)) -> Aut
         raise HTTPException(status_code=409, detail="user_already_exists") from exc
 
     user = crud.update_user_last_login(db, user)
-    return _build_auth_response(user)
+    return _build_auth_response(user, redis)
 
 
 @router.post("/login", response_model=AuthTokenResponse)
@@ -171,10 +180,18 @@ def login(
         raise HTTPException(status_code=403, detail="user_inactive")
 
     user = crud.update_user_last_login(db, user)
-    return _build_auth_response(user)
+    return _build_auth_response(user, redis)
 
 
 @router.get("/me", response_model=UserProfileResponse)
-def me(current_user: models.User = Depends(get_current_active_user)) -> UserProfileResponse:
+def me(
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> UserProfileResponse:
     """返回当前登录用户信息。"""
-    return _serialize_user(current_user)
+    user = crud.get_user_by_id(db, str(current_user.id))
+    if user is None:
+        raise HTTPException(status_code=401, detail="user_not_found")
+    if not bool(user.is_active):
+        raise HTTPException(status_code=403, detail="user_inactive")
+    return _serialize_user(user)

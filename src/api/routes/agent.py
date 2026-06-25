@@ -18,9 +18,8 @@ from redis import Redis
 from sqlalchemy.orm import Session
 
 from src.agent_graph import run_agent_graph
-from src.api import models
 from src.api.deps import get_db, get_redis_dep
-from src.api.deps_auth import get_current_active_user
+from src.api.deps_auth import AuthenticatedUser, get_current_active_user
 from src.api.rate_limit import (
     RateLimitStoreError,
     agent_limit,
@@ -53,7 +52,7 @@ def agent(
     request: Request,
     response: Response,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_active_user),
+    current_user: AuthenticatedUser = Depends(get_current_active_user),
     redis: Redis = Depends(get_redis_dep),
 ) -> AgentResponse:
     """执行最小 Agent 路由。"""

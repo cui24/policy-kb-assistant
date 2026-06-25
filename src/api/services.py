@@ -42,9 +42,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.agent.ticket_extractor import extract_ticket_payload
-from src.api import ask_cache, ask_pipeline, crud, models
+from src.api import ask_cache, ask_persist_queue, ask_pipeline, crud, models
 from src.api import planner
 from src.api.planner import PlannerError
+from src.api.request_timing import get_current_timing, record_timing, timing_span
 from src.api.schemas import (
     AddTicketCommentPlanArgs,
     CancelTicketPlanArgs,
@@ -64,6 +65,8 @@ from src.kb.answer import (
 )
 from src.kb.retrieve import retrieve, retrieve_async
 
+
+_STREAM_CACHE_TOKEN_CHARS = 32
 
 _TICKET_ROUTE_KEYWORDS = (
     "报修",
@@ -440,81 +443,101 @@ async def run_ask_workflow_async(
     user: str | None = None,
     department: str | None = None,
     actor_user_id: str | None = None,
+    auth_ms: int | None = None,
 ) -> dict:
     """执行一次完整的异步 ASK 工作流，并把问答轨迹落库。"""
+    if auth_ms is not None:
+        record_timing("auth", max(0, int(auth_ms or 0)))
+
     request_id = _new_request_id()
     actor = user or "anonymous"
     actor_department = department or "general"
     resolved_actor_user_id = _resolve_actor_user_id(actor_user_id, actor)
 
-    normalized = await ask_pipeline.run_cached_ask_steps_async(question, actor_department)
+    async with timing_span("ask_steps"):
+        normalized = await ask_pipeline.run_cached_ask_steps_async(question, actor_department)
 
-    citations = list(normalized.get("citations") or [])
-    output_meta = dict(normalized.get("output_meta") or {})
-    usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
-    trace_hits = list(normalized.get("trace_hits") or [])
-    retrieve_ms = int(normalized.get("retrieve_ms") or 0)
-    answer_ms = int(normalized.get("answer_ms") or 0)
+    async with timing_span("payload_prepare"):
+        citations = list(normalized.get("citations") or [])
+        output_meta = dict(normalized.get("output_meta") or {})
+        usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
+        trace_hits = list(normalized.get("trace_hits") or [])
+        retrieve_ms = int(normalized.get("retrieve_ms") or 0)
+        answer_ms = int(normalized.get("answer_ms") or 0)
+        cache_meta = ask_cache.cache_meta_from_output_meta(output_meta)
+        cache_lookup_ms = int(cache_meta.get("lookup_ms") or 0)
+        record_timing("cache_lookup", cache_lookup_ms)
+        record_timing("retrieve", retrieve_ms)
+        record_timing("answer", answer_ms)
 
-    kb_query = await crud.create_kb_query_async(
-        db,
-        {
-            "request_id": request_id,
-            "user_name": actor,
-            "actor_user_id": resolved_actor_user_id,
-            "department": actor_department,
-            "question": question,
-            "answer": str(normalized.get("answer") or ""),
-            "citations_json": citations,
-            "retrieve_topk_json": trace_hits,
-            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
-            "latency_retrieve_ms": retrieve_ms,
-            "latency_answer_ms": answer_ms,
-            "model": _model_name(),
-            "valid_json": bool(output_meta.get("json_ok", False)),
-            "failure_reason": output_meta.get("failure_reason"),
-            **usage_metrics,
-        },
-    )
-
-    await crud.create_audit_log_async(
-        db,
-        {
-            "actor": actor,
-            "actor_user_id": resolved_actor_user_id,
-            "action_type": "ASK",
-            "target_type": "KB_QUERY",
-            "target_id": kb_query.id,
-            "request_id": request_id,
-            "payload_json": {
-                "question": question,
-                "department": actor_department,
-                "attempt_stage": output_meta.get("attempt_stage"),
-                "top_hit": trace_hits[0] if trace_hits else None,
-                "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
-                "failure_reason": output_meta.get("failure_reason"),
-                "usage": usage_metrics,
-                "cache": ask_cache.cache_meta_from_output_meta(output_meta),
-            },
-        },
-    )
-
-    return {
+    kb_payload = {
         "request_id": request_id,
-        "query_id": kb_query.id,
+        "user_name": actor,
+        "actor_user_id": resolved_actor_user_id,
+        "department": actor_department,
+        "question": question,
         "answer": str(normalized.get("answer") or ""),
-        "citations": citations,
-        "meta": {
-            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
-            "valid_json": bool(output_meta.get("json_ok", False)),
-            "repair_used": bool(output_meta.get("repair_used", False)),
-            "failure_reason": output_meta.get("failure_reason"),
-            "retrieve_topk": trace_hits,
+        "citations_json": citations,
+        "retrieve_topk_json": trace_hits,
+        "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+        "latency_retrieve_ms": retrieve_ms,
+        "latency_answer_ms": answer_ms,
+        "model": _model_name(),
+        "valid_json": bool(output_meta.get("json_ok", False)),
+        "failure_reason": output_meta.get("failure_reason"),
+        **usage_metrics,
+    }
+    audit_payload = {
+        "actor": actor,
+        "actor_user_id": resolved_actor_user_id,
+        "action_type": "ASK",
+        "target_type": "KB_QUERY",
+        "target_id": "",
+        "request_id": request_id,
+        "payload_json": {
+            "question": question,
+            "department": actor_department,
+            "attempt_stage": output_meta.get("attempt_stage"),
+            "top_hit": trace_hits[0] if trace_hits else None,
             "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+            "failure_reason": output_meta.get("failure_reason"),
             "usage": usage_metrics,
-            "cache": ask_cache.cache_meta_from_output_meta(output_meta),
+            "cache": cache_meta,
         },
     }
+
+    async with timing_span("persist_bundle"):
+        persist_status = await ask_persist_queue.enqueue_ask_persist(kb_payload, audit_payload)
+        if persist_status == "disabled":
+            await crud.create_kb_query_with_audit_async(db, kb_payload, audit_payload)
+    record_timing("kb_insert", 0)
+    record_timing("audit_insert", 0)
+
+    async with timing_span("response_build"):
+        result = {
+            "request_id": request_id,
+            "query_id": "",
+            "answer": str(normalized.get("answer") or ""),
+            "citations": citations,
+            "meta": {
+                "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+                "valid_json": bool(output_meta.get("json_ok", False)),
+                "repair_used": bool(output_meta.get("repair_used", False)),
+                "failure_reason": output_meta.get("failure_reason"),
+                "retrieve_topk": trace_hits,
+                "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+                "usage": usage_metrics,
+                "cache": cache_meta,
+                "diagnostics": {"timing_ms": {}},
+                "persist": {"status": persist_status},
+            },
+        }
+    timing = get_current_timing()
+    timing_ms = timing.snapshot() if timing is not None else {}
+    ask_steps_ms = int(timing_ms.get("ask_steps", 0) or 0)
+    timing_ms["ask_steps_overhead"] = max(0, ask_steps_ms - cache_lookup_ms - retrieve_ms - answer_ms)
+    result["meta"]["diagnostics"] = {"timing_ms": timing_ms}
+    return result
 
 
 def run_ask_workflow_stream(
@@ -643,6 +666,14 @@ def run_ask_workflow_stream(
     yield {"event": "done", "data": {"ok": True, "request_id": request_id}}
 
 
+def _stream_cache_tokens(answer: str, chunk_chars: int = _STREAM_CACHE_TOKEN_CHARS) -> Generator[str, None, None]:
+    """把缓存答案切成稳定小块，复用 SSE token 前端渲染路径。"""
+    text = str(answer or "")
+    size = max(1, int(chunk_chars or _STREAM_CACHE_TOKEN_CHARS))
+    for index in range(0, len(text), size):
+        yield text[index : index + size]
+
+
 async def run_ask_workflow_stream_async(
     db: Session,
     question: str,
@@ -658,8 +689,107 @@ async def run_ask_workflow_stream_async(
 
     yield {"event": "status", "data": {"stage": "started", "request_id": request_id}}
 
+    cache_lookup = ask_cache.read_cached_answer(question, actor_department)
+    if cache_lookup.normalized is not None:
+        cached = cache_lookup.normalized
+        output_meta = dict(cached.get("output_meta") or {})
+        citations = list(cached.get("citations") or [])
+        trace_hits = list(cached.get("trace_hits") or [])
+        usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
+        answer = str(cached.get("answer") or "")
+        answer_chunks = list(_stream_cache_tokens(answer))
+        token_count = len(answer_chunks)
+
+        latency_ms = {
+            "retrieve": 0,
+            "answer": 0,
+            "ttft": 0,
+            "stream_tokens": token_count,
+        }
+        kb_payload = {
+            "request_id": request_id,
+            "user_name": actor,
+            "actor_user_id": resolved_actor_user_id,
+            "department": actor_department,
+            "question": question,
+            "answer": answer,
+            "citations_json": citations,
+            "retrieve_topk_json": trace_hits,
+            "attempt_stage": str(output_meta.get("attempt_stage") or "cache_hit"),
+            "latency_retrieve_ms": 0,
+            "latency_answer_ms": 0,
+            "model": _model_name(),
+            "valid_json": bool(output_meta.get("json_ok", False)),
+            "failure_reason": output_meta.get("failure_reason"),
+            **usage_metrics,
+        }
+        cache_meta = ask_cache.cache_meta_from_output_meta(output_meta)
+        if cache_meta.get("match_type") == "semantic":
+            ask_cache.write_cached_answer(
+                question,
+                actor_department,
+                cached,
+                key=ask_cache.cache_key(question, actor_department),
+            )
+        audit_payload = {
+            "actor": actor,
+            "actor_user_id": resolved_actor_user_id,
+            "action_type": "ASK",
+            "target_type": "KB_QUERY",
+            "target_id": "",
+            "request_id": request_id,
+            "payload_json": {
+                "question": question,
+                "department": actor_department,
+                "attempt_stage": output_meta.get("attempt_stage"),
+                "top_hit": trace_hits[0] if trace_hits else None,
+                "latency_ms": latency_ms,
+                "failure_reason": output_meta.get("failure_reason"),
+                "usage": usage_metrics,
+                "cache": cache_meta,
+                "streamed": True,
+            },
+        }
+        persist_status = await ask_persist_queue.enqueue_ask_persist(kb_payload, audit_payload)
+        if persist_status == "disabled":
+            await crud.create_kb_query_with_audit_async(db, kb_payload, audit_payload)
+        result = {
+            "request_id": request_id,
+            "query_id": "",
+            "answer": answer,
+            "citations": citations,
+            "meta": {
+                "attempt_stage": str(output_meta.get("attempt_stage") or "cache_hit"),
+                "valid_json": bool(output_meta.get("json_ok", False)),
+                "repair_used": bool(output_meta.get("repair_used", False)),
+                "failure_reason": output_meta.get("failure_reason"),
+                "retrieve_topk": trace_hits,
+                "latency_ms": latency_ms,
+                "usage": usage_metrics,
+                "cache": cache_meta,
+                "persist": {"status": persist_status},
+            },
+        }
+        yield {
+            "event": "status",
+            "data": {
+                "stage": "cache_hit",
+                "request_id": request_id,
+                "lookup_ms": int(cache_lookup.latency_ms or 0),
+                "token_events": token_count,
+            },
+        }
+        for delta in answer_chunks:
+            yield {"event": "token", "data": {"delta": delta}}
+        yield {"event": "final", "data": public_kb_response(result)}
+        yield {"event": "done", "data": {"ok": True, "request_id": request_id}}
+        return
+
     retrieve_start = time.perf_counter()
-    hits = await retrieve_async(question)
+    if cache_lookup.query_vector is not None:
+        hits = await retrieve_async(question, query_vector=cache_lookup.query_vector)
+    else:
+        hits = await retrieve_async(question)
     retrieve_ms = int((time.perf_counter() - retrieve_start) * 1000)
     yield {
         "event": "status",
@@ -673,11 +803,24 @@ async def run_ask_workflow_stream_async(
 
     answer_start = time.perf_counter()
     output: dict | None = None
+    ttft_ms: int | None = None
+    stream_token_count = 0
     async for event_payload in stream_answer_with_citations_official_async(question, hits):
         event_name = str(event_payload.get("event") or "")
         if event_name in {"token", "reasoning_token"}:
             delta = str(event_payload.get("delta") or "")
             if delta:
+                if ttft_ms is None:
+                    ttft_ms = int((time.perf_counter() - answer_start) * 1000)
+                    yield {
+                        "event": "status",
+                        "data": {
+                            "stage": "first_token",
+                            "request_id": request_id,
+                            "ttft_ms": ttft_ms,
+                        },
+                    }
+                stream_token_count += 1
                 yield {"event": event_name, "data": {"delta": delta}}
             continue
         if event_name == "final_result":
@@ -686,6 +829,8 @@ async def run_ask_workflow_stream_async(
                 output = raw_result
 
     answer_ms = int((time.perf_counter() - answer_start) * 1000)
+    if ttft_ms is None:
+        ttft_ms = answer_ms
     if not isinstance(output, dict):
         output = {
             "answer": "证据不足：模型未返回有效结果。",
@@ -702,53 +847,71 @@ async def run_ask_workflow_stream_async(
     output_meta = output.get("meta", {}) or {}
     usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
     trace_hits = _trim_hits_for_trace(hits)
+    normalized = ask_pipeline.normalize_answer_payload(
+        output=output,
+        hits=hits,
+        retrieve_ms=retrieve_ms,
+        answer_ms=answer_ms,
+    )
+    cache_status = ask_cache.write_cached_answer(
+        question,
+        actor_department,
+        normalized,
+        key=cache_lookup.key,
+    )
+    output_meta = dict(ask_cache.mark_cache_status(normalized, cache_lookup, status=cache_status).get("output_meta") or {})
+    usage_metrics = ask_pipeline.usage_metrics_from_meta(output_meta)
+    cache_meta = ask_cache.cache_meta_from_output_meta(output_meta)
+    stream_latency_ms = {
+        "retrieve": retrieve_ms,
+        "answer": answer_ms,
+        "ttft": int(ttft_ms or 0),
+        "stream_tokens": int(stream_token_count),
+    }
 
-    kb_query = await crud.create_kb_query_async(
-        db,
-        {
-            "request_id": request_id,
-            "user_name": actor,
-            "actor_user_id": resolved_actor_user_id,
-            "department": actor_department,
+    kb_payload = {
+        "request_id": request_id,
+        "user_name": actor,
+        "actor_user_id": resolved_actor_user_id,
+        "department": actor_department,
+        "question": question,
+        "answer": str(output.get("answer") or ""),
+        "citations_json": citations,
+        "retrieve_topk_json": trace_hits,
+        "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
+        "latency_retrieve_ms": retrieve_ms,
+        "latency_answer_ms": answer_ms,
+        "model": _model_name(),
+        "valid_json": bool(output_meta.get("json_ok", False)),
+        "failure_reason": output_meta.get("failure_reason"),
+        **usage_metrics,
+    }
+    audit_payload = {
+        "actor": actor,
+        "actor_user_id": resolved_actor_user_id,
+        "action_type": "ASK",
+        "target_type": "KB_QUERY",
+        "target_id": "",
+        "request_id": request_id,
+        "payload_json": {
             "question": question,
-            "answer": str(output.get("answer") or ""),
-            "citations_json": citations,
-            "retrieve_topk_json": trace_hits,
-            "attempt_stage": str(output_meta.get("attempt_stage") or "unknown"),
-            "latency_retrieve_ms": retrieve_ms,
-            "latency_answer_ms": answer_ms,
-            "model": _model_name(),
-            "valid_json": bool(output_meta.get("json_ok", False)),
+            "department": actor_department,
+            "attempt_stage": output_meta.get("attempt_stage"),
+            "top_hit": trace_hits[0] if trace_hits else None,
+            "latency_ms": stream_latency_ms,
             "failure_reason": output_meta.get("failure_reason"),
-            **usage_metrics,
+            "usage": usage_metrics,
+            "cache": cache_meta,
+            "streamed": True,
         },
-    )
-
-    await crud.create_audit_log_async(
-        db,
-        {
-            "actor": actor,
-            "actor_user_id": resolved_actor_user_id,
-            "action_type": "ASK",
-            "target_type": "KB_QUERY",
-            "target_id": kb_query.id,
-            "request_id": request_id,
-            "payload_json": {
-                "question": question,
-                "department": actor_department,
-                "attempt_stage": output_meta.get("attempt_stage"),
-                "top_hit": trace_hits[0] if trace_hits else None,
-                "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
-                "failure_reason": output_meta.get("failure_reason"),
-                "usage": usage_metrics,
-                "streamed": True,
-            },
-        },
-    )
+    }
+    persist_status = await ask_persist_queue.enqueue_ask_persist(kb_payload, audit_payload)
+    if persist_status == "disabled":
+        await crud.create_kb_query_with_audit_async(db, kb_payload, audit_payload)
 
     result = {
         "request_id": request_id,
-        "query_id": kb_query.id,
+        "query_id": "",
         "answer": str(output.get("answer") or ""),
         "citations": citations,
         "meta": {
@@ -757,8 +920,19 @@ async def run_ask_workflow_stream_async(
             "repair_used": bool(output_meta.get("repair_used", False)),
             "failure_reason": output_meta.get("failure_reason"),
             "retrieve_topk": trace_hits,
-            "latency_ms": {"retrieve": retrieve_ms, "answer": answer_ms},
+            "latency_ms": stream_latency_ms,
             "usage": usage_metrics,
+            "cache": cache_meta,
+            "persist": {"status": persist_status},
+        },
+    }
+    yield {
+        "event": "status",
+        "data": {
+            "stage": "stream_done",
+            "request_id": request_id,
+            "answer_ms": answer_ms,
+            "token_events": stream_token_count,
         },
     }
     yield {"event": "final", "data": public_kb_response(result)}

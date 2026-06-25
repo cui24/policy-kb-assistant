@@ -26,6 +26,8 @@ from sqlalchemy.pool import StaticPool
 from src.api import crud, models, planner as planner_module, planner_eval, services, skills
 from src.api.db import Base
 from src.api.schemas import ToolPlan
+from src.kb import answer as answer_module
+from src.kb import retrieve as retrieve_module
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +61,7 @@ def _patch_default_ask_pipeline(monkeypatch) -> None:
     monkeypatch.setattr(
         services.ask_pipeline,
         "run_retrieve_step",
-        lambda question: ([dict(item) for item in default_hits], 0),
+        lambda question, **kwargs: ([dict(item) for item in default_hits], 0),
     )
     monkeypatch.setattr(
         services.ask_pipeline,
@@ -146,6 +148,15 @@ def _patch_in_memory_ask_cache(monkeypatch) -> dict:
     monkeypatch.setattr(services.ask_cache.redis_client, "get_json", lambda key: store.get(key))
     monkeypatch.setattr(services.ask_cache.redis_client, "set_json", _fake_set_json)
     return store
+
+
+def _patch_fake_question_embedding(monkeypatch, vectors: dict[str, list[float]]) -> None:
+    """固定语义缓存向量，避免单测加载真实 embedding 模型。"""
+    monkeypatch.setattr(
+        services.ask_cache,
+        "_question_embedding",
+        lambda question: list(vectors[services.ask_cache.normalize_question(question)]),
+    )
 
 
 
@@ -581,6 +592,87 @@ def test_run_ask_workflow_async_persists_query_and_audit(monkeypatch) -> None:
         db.close()
 
 
+def test_run_ask_workflow_async_can_queue_persist_bundle(monkeypatch) -> None:
+    """开启本地异步持久化后，ASK 请求路径应只入队，不同步写库。"""
+    monkeypatch.setenv("ASK_ASYNC_PERSIST_ENABLED", "true")
+    queued: list[services.ask_persist_queue.AskPersistItem] = []
+
+    async def _fake_enqueue(kb_payload: dict, audit_payload: dict) -> str:
+        queued.append(services.ask_persist_queue.AskPersistItem(kb_payload, audit_payload))
+        return "queued"
+
+    async def _fake_retrieve(question: str):
+        return [
+            {
+                "doc_id": "henu_network_manual",
+                "page": 5,
+                "score": 0.88,
+                "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+            }
+        ], 0
+
+    async def _fake_answer(question: str, hits: list[dict]):
+        return {
+            "answer": "统一身份认证的登录地址是 https://ids.henu.edu.cn。",
+            "citations": [{"doc_id": "henu_network_manual", "page": 5, "snippet": "统一身份认证登录地址"}],
+            "meta": {
+                "attempt_stage": "primary_async",
+                "json_ok": True,
+                "repair_used": False,
+                "failure_reason": None,
+            },
+        }, 0
+
+    monkeypatch.setattr(services.ask_persist_queue, "enqueue_ask_persist", _fake_enqueue)
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step_async", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step_async", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        result = asyncio.run(
+            services.run_ask_workflow_async(
+                db,
+                question="统一身份认证的登录地址是什么？",
+                user="alice",
+                department="IT",
+            )
+        )
+
+        assert result["meta"]["persist"]["status"] == "queued"
+        assert len(queued) == 1
+        assert crud.list_kb_queries(db, request_id=result["request_id"], limit=10) == []
+
+        services.ask_persist_queue._persist_batch_in_session(db, queued)
+        kb_records = crud.list_kb_queries(db, request_id=result["request_id"], limit=10)
+        assert len(kb_records) == 1
+        audit_records = crud.list_audit_logs(db, request_id=result["request_id"], limit=10)
+        assert len(audit_records) == 1
+    finally:
+        db.close()
+
+
+def test_ask_async_persist_shutdown_waits_for_worker(monkeypatch) -> None:
+    """停机时应设置停止信号，并在超时时间内等待后台 writer 刷完。"""
+    async def _run() -> None:
+        stop_seen = asyncio.Event()
+
+        async def _fake_worker() -> None:
+            assert services.ask_persist_queue._stop_event is not None
+            await services.ask_persist_queue._stop_event.wait()
+            stop_seen.set()
+
+        services.ask_persist_queue._stop_event = asyncio.Event()
+        services.ask_persist_queue._worker_task = asyncio.create_task(_fake_worker())
+        monkeypatch.setattr(services.ask_persist_queue, "shutdown_flush_timeout_seconds", lambda: 2.0)
+
+        await services.ask_persist_queue.stop_worker()
+
+        assert stop_seen.is_set()
+        assert services.ask_persist_queue._worker_task is None
+
+    asyncio.run(_run())
+
+
 def test_run_ask_workflow_async_uses_redis_cache(monkeypatch) -> None:
     """异步非流式 ASK 也应复用同一份 Redis 缓存。"""
     monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
@@ -704,9 +796,17 @@ def test_run_ask_workflow_stream_async_emits_events_and_persists(monkeypatch) ->
 
         assert events[0]["event"] == "status"
         assert any(item["event"] == "token" for item in events)
+        first_token_event = next(
+            item
+            for item in events
+            if item["event"] == "status" and item["data"].get("stage") == "first_token"
+        )
+        assert first_token_event["data"]["ttft_ms"] >= 0
         final_event = next(item for item in events if item["event"] == "final")
         done_event = next(item for item in events if item["event"] == "done")
         assert final_event["data"]["answer"] == "你好"
+        assert final_event["data"]["meta"]["latency_ms"]["ttft"] >= 0
+        assert final_event["data"]["meta"]["latency_ms"]["stream_tokens"] == 2
         assert done_event["data"]["ok"] is True
 
         request_id = str(final_event["data"]["request_id"])
@@ -716,8 +816,487 @@ def test_run_ask_workflow_stream_async_emits_events_and_persists(monkeypatch) ->
         audit_records = crud.list_audit_logs(db, request_id=request_id, limit=10)
         assert len(audit_records) == 1
         assert audit_records[0].action_type == "ASK"
+        assert audit_records[0].payload_json["latency_ms"]["ttft"] >= 0
+        assert audit_records[0].payload_json["latency_ms"]["stream_tokens"] == 2
     finally:
         db.close()
+
+
+def test_run_ask_workflow_stream_async_uses_redis_cache(monkeypatch) -> None:
+    """异步流式 ASK 第二次相同问题应命中缓存，不再调用检索和 LLM。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-stream-cache")
+    store = _patch_in_memory_ask_cache(monkeypatch)
+    calls = {"retrieve": 0, "stream": 0}
+
+    async def _fake_retrieve(question: str):
+        calls["retrieve"] += 1
+        return [
+            {
+                "doc_id": "henu_network_manual",
+                "page": 8,
+                "score": 0.93,
+                "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+            }
+        ]
+
+    async def _fake_stream(question: str, evidence: list[dict]):
+        calls["stream"] += 1
+        yield {"event": "token", "delta": "统一身份认证"}
+        yield {"event": "token", "delta": "登录地址"}
+        yield {
+            "event": "final_result",
+            "result": {
+                "answer": "统一身份认证登录地址是 https://ids.henu.edu.cn。",
+                "citations": [
+                    {
+                        "doc_id": "henu_network_manual",
+                        "page": 8,
+                        "snippet": "统一身份认证登录地址 https://ids.henu.edu.cn",
+                    }
+                ],
+                "meta": {
+                    "attempt_stage": "primary_stream_async",
+                    "json_ok": True,
+                    "repair_used": False,
+                    "failure_reason": None,
+                },
+            },
+        }
+
+    monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
+    monkeypatch.setattr(services, "stream_answer_with_citations_official_async", _fake_stream)
+
+    async def _collect(db: Session) -> list[dict]:
+        items: list[dict] = []
+        async for item in services.run_ask_workflow_stream_async(
+            db,
+            question="统一身份认证的登录地址是什么？",
+            user="alice",
+            department="IT",
+        ):
+            items.append(item)
+        return items
+
+    db = _build_test_session()
+    try:
+        first_events = asyncio.run(_collect(db))
+        second_events = asyncio.run(_collect(db))
+
+        assert len(store) == 1
+        assert calls == {"retrieve": 1, "stream": 1}
+        assert any(
+            item["event"] == "status" and item["data"].get("stage") == "first_token"
+            for item in first_events
+        )
+        assert not any(
+            item["event"] == "status" and item["data"].get("stage") == "retrieve_done"
+            for item in second_events
+        )
+        cache_event = next(
+            item
+            for item in second_events
+            if item["event"] == "status" and item["data"].get("stage") == "cache_hit"
+        )
+        final_event = next(item for item in second_events if item["event"] == "final")
+        assert cache_event["data"]["token_events"] >= 1
+        assert final_event["data"]["answer"] == "统一身份认证登录地址是 https://ids.henu.edu.cn。"
+        assert final_event["data"]["meta"]["attempt_stage"] == "cache_hit"
+        assert final_event["data"]["meta"]["cache"]["hit"] is True
+        assert final_event["data"]["meta"]["latency_ms"]["retrieve"] == 0
+        assert final_event["data"]["meta"]["latency_ms"]["answer"] == 0
+
+        request_id = str(final_event["data"]["request_id"])
+        audit_records = crud.list_audit_logs(db, request_id=request_id, limit=10)
+        assert len(audit_records) == 1
+        assert audit_records[0].payload_json["cache"]["hit"] is True
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_stream_async_uses_semantic_cache(monkeypatch) -> None:
+    """语义缓存开启且相似度足够高时，相近问法应复用缓存答案。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_THRESHOLD", "0.97")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-stream-semantic-cache")
+    _patch_in_memory_ask_cache(monkeypatch)
+    _patch_fake_question_embedding(
+        monkeypatch,
+        {
+            "公司报销流程是什么？": [1.0, 0.0, 0.0],
+            "公司的报销流程是什么？": [0.98, 0.2, 0.0],
+        },
+    )
+    calls = {"retrieve": 0, "stream": 0}
+
+    async def _fake_retrieve(question: str, top_k=None, *, query_vector=None):
+        calls["retrieve"] += 1
+        return [{"doc_id": "FIN-01", "page": 1, "score": 0.9, "snippet": "报销流程说明"}]
+
+    async def _fake_stream(question: str, evidence: list[dict]):
+        calls["stream"] += 1
+        yield {"event": "token", "delta": "报销"}
+        yield {
+            "event": "final_result",
+            "result": {
+                "answer": "报销流程为提交单据后审批。",
+                "citations": [{"doc_id": "FIN-01", "page": 1, "snippet": "报销流程说明"}],
+                "meta": {
+                    "attempt_stage": "primary_stream_async",
+                    "json_ok": True,
+                    "repair_used": False,
+                    "failure_reason": None,
+                },
+            },
+        }
+
+    monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
+    monkeypatch.setattr(services, "stream_answer_with_citations_official_async", _fake_stream)
+
+    async def _collect(question: str, db: Session) -> list[dict]:
+        items: list[dict] = []
+        async for item in services.run_ask_workflow_stream_async(
+            db,
+            question=question,
+            user="alice",
+            department="FIN",
+        ):
+            items.append(item)
+        return items
+
+    db = _build_test_session()
+    try:
+        asyncio.run(_collect("公司报销流程是什么？", db))
+        second_events = asyncio.run(_collect("公司的报销流程是什么？", db))
+        third_events = asyncio.run(_collect("公司的报销流程是什么？", db))
+
+        assert calls == {"retrieve": 1, "stream": 1}
+        cache_event = next(
+            item
+            for item in second_events
+            if item["event"] == "status" and item["data"].get("stage") == "cache_hit"
+        )
+        final_event = next(item for item in second_events if item["event"] == "final")
+        assert cache_event["data"]["token_events"] >= 1
+        assert final_event["data"]["meta"]["attempt_stage"] == "semantic_cache_hit"
+        assert final_event["data"]["meta"]["cache"]["hit"] is True
+        assert final_event["data"]["meta"]["cache"]["status"] == "semantic_hit"
+        assert final_event["data"]["meta"]["cache"]["match_type"] == "semantic"
+        assert final_event["data"]["meta"]["cache"]["similarity"] >= 0.97
+        assert final_event["data"]["meta"]["latency_ms"]["retrieve"] == 0
+        third_final = next(item for item in third_events if item["event"] == "final")
+        assert third_final["data"]["meta"]["cache"]["status"] == "hit"
+        assert third_final["data"]["meta"]["cache"]["match_type"] == "exact"
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_stream_async_rejects_low_similarity_semantic_cache(monkeypatch) -> None:
+    """相似度低于阈值时不能复用语义缓存，必须重新检索和生成。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_THRESHOLD", "0.97")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-stream-semantic-cache-miss")
+    _patch_in_memory_ask_cache(monkeypatch)
+    _patch_fake_question_embedding(
+        monkeypatch,
+        {
+            "公司报销流程是什么？": [1.0, 0.0, 0.0],
+            "年假怎么申请？": [0.0, 1.0, 0.0],
+        },
+    )
+    calls = {"retrieve": 0, "stream": 0}
+
+    async def _fake_retrieve(question: str, top_k=None, *, query_vector=None):
+        calls["retrieve"] += 1
+        return [{"doc_id": "DOC", "page": 1, "score": 0.9, "snippet": question}]
+
+    async def _fake_stream(question: str, evidence: list[dict]):
+        calls["stream"] += 1
+        yield {"event": "token", "delta": question[:2]}
+        yield {
+            "event": "final_result",
+            "result": {
+                "answer": f"回答：{question}",
+                "citations": [{"doc_id": "DOC", "page": 1, "snippet": question}],
+                "meta": {
+                    "attempt_stage": "primary_stream_async",
+                    "json_ok": True,
+                    "repair_used": False,
+                    "failure_reason": None,
+                },
+            },
+        }
+
+    monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
+    monkeypatch.setattr(services, "stream_answer_with_citations_official_async", _fake_stream)
+
+    async def _collect(question: str, db: Session) -> list[dict]:
+        items: list[dict] = []
+        async for item in services.run_ask_workflow_stream_async(
+            db,
+            question=question,
+            user="alice",
+            department="FIN",
+        ):
+            items.append(item)
+        return items
+
+    db = _build_test_session()
+    try:
+        asyncio.run(_collect("公司报销流程是什么？", db))
+        second_events = asyncio.run(_collect("年假怎么申请？", db))
+
+        assert calls == {"retrieve": 2, "stream": 2}
+        assert not any(
+            item["event"] == "status" and item["data"].get("stage") == "cache_hit"
+            for item in second_events
+        )
+        final_event = next(item for item in second_events if item["event"] == "final")
+        assert final_event["data"]["answer"] == "回答：年假怎么申请？"
+        assert final_event["data"]["meta"]["cache"]["hit"] is False
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_stream_async_reuses_semantic_miss_vector(monkeypatch) -> None:
+    """语义缓存 miss 后应把已计算 query vector 传给 retrieve，避免重复 embedding。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_THRESHOLD", "0.97")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-stream-semantic-vector-reuse")
+    _patch_in_memory_ask_cache(monkeypatch)
+    expected_vector = [0.2, 0.8, 0.0]
+    _patch_fake_question_embedding(monkeypatch, {"年假怎么申请？": expected_vector})
+    observed_vectors: list[list[float] | None] = []
+
+    async def _fake_retrieve(question: str, top_k=None, *, query_vector=None):
+        observed_vectors.append(query_vector)
+        return [{"doc_id": "HR-01", "page": 1, "score": 0.9, "snippet": "年假申请"}]
+
+    async def _fake_stream(question: str, evidence: list[dict]):
+        yield {"event": "token", "delta": "年假"}
+        yield {
+            "event": "final_result",
+            "result": {
+                "answer": "年假需要提交申请。",
+                "citations": [{"doc_id": "HR-01", "page": 1, "snippet": "年假申请"}],
+                "meta": {
+                    "attempt_stage": "primary_stream_async",
+                    "json_ok": True,
+                    "repair_used": False,
+                    "failure_reason": None,
+                },
+            },
+        }
+
+    monkeypatch.setattr(services, "retrieve_async", _fake_retrieve)
+    monkeypatch.setattr(services, "stream_answer_with_citations_official_async", _fake_stream)
+
+    async def _collect(db: Session) -> list[dict]:
+        items: list[dict] = []
+        async for item in services.run_ask_workflow_stream_async(
+            db,
+            question="年假怎么申请？",
+            user="alice",
+            department="HR",
+        ):
+            items.append(item)
+        return items
+
+    db = _build_test_session()
+    try:
+        events = asyncio.run(_collect(db))
+        assert observed_vectors == [expected_vector]
+        final_event = next(item for item in events if item["event"] == "final")
+        assert final_event["data"]["meta"]["cache"]["hit"] is False
+    finally:
+        db.close()
+
+
+def test_run_ask_workflow_async_reuses_semantic_miss_vector(monkeypatch) -> None:
+    """非流式异步 ASK 语义缓存 miss 后也应复用已计算 query vector。"""
+    monkeypatch.setenv("ASK_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_ENABLED", "true")
+    monkeypatch.setenv("ASK_SEMANTIC_CACHE_THRESHOLD", "0.97")
+    monkeypatch.setenv("ASK_CACHE_NAMESPACE_VERSION", "test-async-semantic-vector-reuse")
+    _patch_in_memory_ask_cache(monkeypatch)
+    expected_vector = [0.1, 0.9, 0.0]
+    _patch_fake_question_embedding(monkeypatch, {"年假怎么申请？": expected_vector})
+    observed_vectors: list[list[float] | None] = []
+
+    async def _fake_retrieve(question: str, *, query_vector=None):
+        observed_vectors.append(query_vector)
+        return [{"doc_id": "HR-01", "page": 1, "score": 0.9, "snippet": "年假申请"}], 12
+
+    async def _fake_answer(question: str, hits: list[dict]):
+        return {
+            "answer": "年假需要提交申请。",
+            "citations": [{"doc_id": "HR-01", "page": 1, "snippet": "年假申请"}],
+            "meta": {
+                "attempt_stage": "primary_async",
+                "json_ok": True,
+                "repair_used": False,
+                "failure_reason": None,
+            },
+        }, 23
+
+    monkeypatch.setattr(services.ask_pipeline, "run_retrieve_step_async", _fake_retrieve)
+    monkeypatch.setattr(services.ask_pipeline, "run_answer_step_async", _fake_answer)
+
+    db = _build_test_session()
+    try:
+        result = asyncio.run(
+            services.run_ask_workflow_async(
+                db,
+                question="年假怎么申请？",
+                user="alice",
+                department="HR",
+            )
+        )
+        assert observed_vectors == [expected_vector]
+        assert result["meta"]["cache"]["hit"] is False
+    finally:
+        db.close()
+
+
+def test_async_stream_llm_circuit_opens_after_failures(monkeypatch) -> None:
+    """流式 LLM 连续调用失败后应短期开路，避免每个请求都等待远程超时。"""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_CIRCUIT_REDIS_ENABLED", "false")
+    monkeypatch.setenv("OPENAI_CIRCUIT_FAIL_THRESHOLD", "1")
+    monkeypatch.setenv("OPENAI_CIRCUIT_OPEN_SECONDS", "30")
+    answer_module.reset_llm_circuit_breaker()
+
+    class _FailingCompletions:
+        async def create(self, **kwargs):
+            raise RuntimeError("remote_down")
+
+    class _FailingClient:
+        def __init__(self, **kwargs) -> None:
+            self.chat = type("Chat", (), {"completions": _FailingCompletions()})()
+
+    monkeypatch.setattr(answer_module, "AsyncOpenAI", _FailingClient)
+    evidence = [{"doc_id": "DOC", "page": 1, "score": 0.9, "snippet": "制度原文"}]
+
+    async def _collect() -> list[dict]:
+        return [item async for item in answer_module.stream_answer_with_citations_official_async("问题", evidence)]
+
+    first = asyncio.run(_collect())
+    second = asyncio.run(_collect())
+
+    first_result = first[-1]["result"]
+    second_result = second[-1]["result"]
+    assert first_result["meta"]["attempt_stage"] == "stream_failed"
+    assert second_result["meta"]["attempt_stage"] == "llm_circuit_open"
+    assert str(second_result["meta"]["failure_reason"]).startswith("llm_circuit_open")
+    answer_module.reset_llm_circuit_breaker()
+
+
+def test_async_stream_llm_circuit_honors_redis_open_state(monkeypatch) -> None:
+    """Redis 熔断状态打开时，当前 Worker 不应继续调用 LLM。"""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_CIRCUIT_REDIS_ENABLED", "true")
+    answer_module.reset_llm_circuit_breaker()
+
+    calls = {"llm": 0}
+
+    class _FakeRedis:
+        def get(self, key: str):
+            if key == "circuit:llm:open_until":
+                import time
+
+                return str(time.time() + 30)
+            return None
+
+    class _UnexpectedCompletions:
+        async def create(self, **kwargs):
+            calls["llm"] += 1
+            raise AssertionError("LLM should not be called when Redis circuit is open")
+
+    class _UnexpectedClient:
+        def __init__(self, **kwargs) -> None:
+            self.chat = type("Chat", (), {"completions": _UnexpectedCompletions()})()
+
+    monkeypatch.setattr(answer_module.redis_client, "get_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(answer_module, "AsyncOpenAI", _UnexpectedClient)
+    evidence = [{"doc_id": "DOC", "page": 1, "score": 0.9, "snippet": "制度原文"}]
+
+    async def _collect() -> list[dict]:
+        return [item async for item in answer_module.stream_answer_with_citations_official_async("问题", evidence)]
+
+    events = asyncio.run(_collect())
+    result = events[-1]["result"]
+    assert calls["llm"] == 0
+    assert result["meta"]["attempt_stage"] == "llm_circuit_open"
+
+
+def test_qdrant_circuit_opens_after_dense_failures(monkeypatch) -> None:
+    """Qdrant 连续异常后应快速返回空证据，由回答层做安全拒答。"""
+    monkeypatch.setenv("QDRANT_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("QDRANT_CIRCUIT_REDIS_ENABLED", "false")
+    monkeypatch.setenv("QDRANT_CIRCUIT_FAIL_THRESHOLD", "1")
+    monkeypatch.setenv("QDRANT_CIRCUIT_OPEN_SECONDS", "30")
+    retrieve_module.reset_qdrant_circuit_breaker()
+
+    class _FakeModel:
+        def encode(self, values, normalize_embeddings=True):
+            return type("Encoded", (), {"tolist": lambda self: [[0.1, 0.2, 0.3]]})()
+
+    calls = {"client": 0}
+
+    def _fake_client(url: str):
+        calls["client"] += 1
+        return object()
+
+    def _raise_dense(*args, **kwargs):
+        raise RuntimeError("qdrant_down")
+
+    monkeypatch.setattr(retrieve_module, "_get_embedding_model", lambda model_name: _FakeModel())
+    monkeypatch.setattr(retrieve_module, "_get_qdrant_client", _fake_client)
+    monkeypatch.setattr(retrieve_module, "_query_qdrant_dense", _raise_dense)
+
+    first = retrieve_module.retrieve("测试问题")
+    second = retrieve_module.retrieve("测试问题")
+
+    assert first == []
+    assert second == []
+    assert calls["client"] == 1
+    retrieve_module.reset_qdrant_circuit_breaker()
+
+
+def test_qdrant_circuit_honors_redis_open_state(monkeypatch) -> None:
+    """Redis 熔断状态打开时，当前 Worker 不应继续访问 Qdrant。"""
+    monkeypatch.setenv("QDRANT_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("QDRANT_CIRCUIT_REDIS_ENABLED", "true")
+    retrieve_module.reset_qdrant_circuit_breaker()
+    calls = {"client": 0}
+
+    class _FakeModel:
+        def encode(self, values, normalize_embeddings=True):
+            return type("Encoded", (), {"tolist": lambda self: [[0.1, 0.2, 0.3]]})()
+
+    class _FakeRedis:
+        def get(self, key: str):
+            if key == "circuit:qdrant:open_until":
+                import time
+
+                return str(time.time() + 30)
+            return None
+
+    def _fake_client(url: str):
+        calls["client"] += 1
+        return object()
+
+    monkeypatch.setattr(retrieve_module.redis_client, "get_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(retrieve_module, "_get_embedding_model", lambda model_name: _FakeModel())
+    monkeypatch.setattr(retrieve_module, "_get_qdrant_client", _fake_client)
+
+    assert retrieve_module.retrieve("测试问题") == []
+    assert calls["client"] == 0
 
 
 def test_create_ticket_workflow_persists_ticket_and_audit() -> None:
